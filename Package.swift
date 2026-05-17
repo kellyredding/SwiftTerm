@@ -22,12 +22,9 @@ let targets: [Target] = [
         name: "SwiftTerm",
         dependencies: [],
         path: "Sources/SwiftTerm",
-        exclude: platformExcludes + ["Mac/README.md"],
-//        swiftSettings: [
-//            .unsafeFlags(["-enforce-exclusivity=none"])
-//        ]
+        exclude: platformExcludes + ["Mac/README.md"]
     ),
-    .executableTarget (
+    .executableTarget(
         name: "SwiftTermFuzz",
         dependencies: ["SwiftTerm"],
         path: "Sources/SwiftTermFuzz"
@@ -52,23 +49,15 @@ let targets: [Target] = [
     .target(
         name: "SwiftTerm",
         //
-        // We can not use Swift Subprocess, because there is no way of configuring the child process to
-        // be a controlling terminal, as it is posix-spawn based.
-//        dependencies: [
-//            .product(name: "Subprocess", package: "swift-subprocess", condition: .when(platforms: [.macOS, .linux]))
-//        ],
         path: "Sources/SwiftTerm",
-        exclude: platformExcludes + ["Mac/README.md"],
-//        swiftSettings: [
-//            .unsafeFlags(["-enforce-exclusivity=none"])
-//        ]
+        exclude: platformExcludes + ["Mac/README.md"]
     ),
-    .executableTarget (
+    .executableTarget(
         name: "SwiftTermFuzz",
         dependencies: ["SwiftTerm"],
         path: "Sources/SwiftTermFuzz"
     ),
-    .executableTarget (
+    .executableTarget(
         name: "Termcast",
         dependencies: [
             "SwiftTerm",

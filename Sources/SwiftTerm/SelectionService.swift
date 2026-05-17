@@ -13,7 +13,7 @@ import Foundation
  * property, and if that is true, then the `start` and `end` represents offsets within
  * the terminal's buffer.  They are guaranteed to be ordered.
  */
-class SelectionService: CustomDebugStringConvertible {
+public class SelectionService: CustomDebugStringConvertible {
     var terminal: Terminal
     
     public init (terminal: Terminal)
@@ -531,7 +531,30 @@ class SelectionService: CustomDebugStringConvertible {
             selectionMode = .character
         }
     }
-    
+
+    // GALAXY: Adjusts selection positions when the circular buffer trims
+    // its oldest lines. Each trim shifts all buffer indices by -1, so
+    // selection rows must be decremented to continue pointing at the
+    // same content. If either endpoint has been trimmed away (row < 0),
+    // the selected content no longer exists and the selection is
+    // invalidated. Both start and end are checked because they are not
+    // guaranteed to be ordered — dragging upward makes end.row < start.row.
+    func adjustForTrimmedLines (_ count: Int) {
+        guard count > 0 else { return }
+        let newStartRow = start.row - count
+        let newEndRow = end.row - count
+        if newStartRow < 0 || newEndRow < 0 {
+            active = false
+            return
+        }
+        start = Position(col: start.col, row: newStartRow)
+        end = Position(col: end.col, row: newEndRow)
+        if let p = pivot {
+            let newPivotRow = p.row - count
+            pivot = newPivotRow >= 0 ? Position(col: p.col, row: newPivotRow) : nil
+        }
+    }
+
     public func getSelectedText () -> String {
         let (min, max) = if Position.compare(start, end) == .before {
             (start, end)

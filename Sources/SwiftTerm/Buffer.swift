@@ -24,12 +24,12 @@ public final class Buffer {
     
     // this keeps incrementing even as we run out of space in _lines and trim out
     // old lines.
-    var linesTop: Int 
+    public var linesTop: Int
     
     /// This is the index into the `lines` array that corresponds to the top row of displayed
     /// content in the terminal when the scroll is zero.   So the terminal contents that the application
     /// has access to are `lines [yBase..(yBase+rows)]`
-    var yBase: Int {
+    public var yBase: Int {
         get { _yBase }
         set {
             if newValue > _lines.count {
@@ -185,11 +185,11 @@ public final class Buffer {
     public var savedCharset: [UInt8:String]? = nil
     
     var hasScrollback : Bool
-    var cols: Int {
+    public var cols: Int {
         get { _cols }
         set { _cols = newValue }
     }
-    var rows: Int {
+    public var rows: Int {
         get { _rows }
         set { _rows = newValue }
     }
@@ -198,7 +198,7 @@ public final class Buffer {
     
     var scrollback: Int?
     
-    var lines : CircularBufferLineList {
+    public var lines : CircularBufferLineList {
         get { return _lines }
     }
 
@@ -421,7 +421,7 @@ public final class Buffer {
             // Deal with columns increasing (reducing needs to happen after reflow)
             
             if cols < newCols {
-                for i in 0..<lines.maxLength {
+                for i in 0..<lines.count {
                     lines [i].resize (cols: newCols, fillData: CharData.Null)
                 }
 
@@ -503,7 +503,7 @@ public final class Buffer {
             reflow (newCols, newRows)
             // Trim the end of the line off if cols shrunk
             if cols > newCols {
-                for i in 0..<lines.maxLength {
+                for i in 0..<lines.count {
                     lines [i].resize (cols: newCols, fillData: CharData.Null)
                 }
             }
@@ -511,7 +511,7 @@ public final class Buffer {
         
         // DEBUG: Post-condition
         if lines.count > 0 {
-            for i in 0..<lines.maxLength {
+            for i in 0..<lines.count {
                 let line = lines [i]
                 if line.count < newCols {
                     print ("stop here newCols=\(newCols) but the element has: \(line.count)")

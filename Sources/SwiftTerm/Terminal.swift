@@ -91,7 +91,7 @@ public protocol TerminalDelegate: AnyObject {
     /// Invoked when synchronized output mode is toggled on or off.
     /// The default implementation does nothing.
     func synchronizedOutputChanged (source: Terminal, active: Bool)
-    
+
     /// Should raise the bell
     /// The default implementation does nothing.
     func bell (source: Terminal)
@@ -308,10 +308,10 @@ open class Terminal {
     let MINIMUM_ROWS = 1
     
     /// The current terminal columns (counting from 1)
-    public private(set) var cols: Int = 80
+    public var cols: Int = 80
     
     /// The current terminal rows (counting from 1)
-    public private(set) var rows: Int = 25
+    public var rows: Int = 25
     var tabStopWidth : Int = 8
     
     /// Terminal configuration options.
@@ -319,11 +319,11 @@ open class Terminal {
     public var options: TerminalOptions
     
     // The current buffers
-    var normalBuffer, altBuffer: Buffer
+    public var normalBuffer, altBuffer: Buffer
     /**
      * Returns the active buffer (either the normal buffer or the alternative buffer)
      */
-    public private(set) var buffer: Buffer
+    public var buffer: Buffer
 
     private let synchronizedOutputTimeoutSeconds: TimeInterval = 1.0
     private var synchronizedOutputActive: Bool = false
@@ -331,7 +331,7 @@ open class Terminal {
     private var synchronizedOutputBufferIsAlternate: Bool = false
     private var synchronizedOutputTimeoutItem: DispatchWorkItem?
 
-    var displayBuffer: Buffer {
+    public var displayBuffer: Buffer {
         synchronizedOutputBuffer ?? buffer
     }
 
@@ -351,7 +351,7 @@ open class Terminal {
     
     // You can ignore most of the defaults set here, the function
     // reset() will do that again
-    var sendFocus: Bool = false
+    public var sendFocus: Bool = false
     var cursorHidden : Bool = false
     
     /// Controls the origin mode (DECOM), when set, the screen is limited to the top and bottom margins
@@ -408,7 +408,7 @@ open class Terminal {
     var refreshEnd = -1
     var scrollInvariantRefreshStart = Int.max
     var scrollInvariantRefreshEnd = -1
-    var userScrolling = false
+    public var userScrolling = false
     var lineFeedMode = false
     
     // We do not implement smooth scrolling here, dubious value, but
@@ -2397,6 +2397,13 @@ open class Terminal {
 
     func cmdRestoreCursor (_ pars: [Int], _ collect: cstring)
     {
+        // CSI u (no prefix) = SCORC — restore saved cursor position.
+        // CSI > Ps u = Kitty keyboard protocol push (not a cursor op).
+        // CSI < u   = Kitty keyboard protocol pop  (not a cursor op).
+        // CSI = Ps u = Kitty keyboard protocol push (alternate form).
+        // Only restore the cursor for the plain, unprefixed form.
+        guard collect.count == 0 else { return }
+
         // Clamp savedX and savedY to valid ranges to prevent abort() in Debug builds.
         // Saved values can become invalid after resize/scroll operations.
         buffer.x = min(max(0, buffer.savedX), cols - 1)
@@ -5214,6 +5221,7 @@ open class Terminal {
         guard synchronizedOutputActive else {
             return
         }
+
         synchronizedOutputActive = false
         synchronizedOutputBuffer = nil
         synchronizedOutputBufferIsAlternate = false
@@ -5236,7 +5244,7 @@ open class Terminal {
         DispatchQueue.main.asyncAfter(deadline: .now() + synchronizedOutputTimeoutSeconds, execute: workItem)
     }
 
-    private func snapshotBuffer (_ source: Buffer) -> Buffer
+    public func snapshotBuffer (_ source: Buffer) -> Buffer
     {
         let copy = Buffer(cols: source.cols, rows: source.rows, tabStopWidth: tabStopWidth, scrollback: source.scrollback)
         copy.xDisp = source.xDisp
@@ -5267,7 +5275,7 @@ open class Terminal {
         return copy
     }
 
-    func setViewYDisp (_ newValue: Int)
+    public func setViewYDisp (_ newValue: Int)
     {
         buffer.yDisp = newValue
         synchronizedOutputBuffer?.yDisp = newValue

@@ -14,6 +14,13 @@ import ImageIO
 #endif
 import SwiftUI
 
+// GALAXY: Custom attribute key to carry bold state through to glyph rendering.
+// Needed because fonts without a bold variant (e.g. Monaco) make the bold font
+// identical to normal, so comparing runFont == fontSet.bold is unreliable.
+extension NSAttributedString.Key {
+    static let galaxyBold = NSAttributedString.Key("galaxyBold")
+}
+
 #if os(iOS) || os(visionOS)
 import UIKit
 typealias TTColor = UIColor
@@ -57,7 +64,8 @@ struct ViewLineInfo {
 }
 
 extension TerminalView {
-    typealias CellDimension = CGSize
+    // GALAXY: public so ScrollbackTerminalView can access cellDimension
+    public typealias CellDimension = CGSize
     
     func resetCaches ()
     {
@@ -141,17 +149,44 @@ extension TerminalView {
     func processSizeChange (newSize: CGSize) -> Bool {
         let newRows = Int (newSize.height / cellDimension.height)
         let newCols = Int (getEffectiveWidth (size: newSize) / cellDimension.width)
-        
+
         if newCols != terminal.cols || newRows != terminal.rows {
+            // GALAXY: Capture pre-reflow "riding the live tail" intent so we
+            // can re-pin yDisp = yBase if reflow nudges the viewport short
+            // of the buffer bottom. Column changes recompute every wrapped
+            // line; even with userScrolling=false, yDisp can land one or
+            // more rows below yBase after the recompute, which leaves
+            // streaming output with no auto-follow until the user scrolls.
+            // Only restore when the user was clearly following live output
+            // (no scrollback offset, no active selection, no userScrolling
+            // gate). Anything else — they wanted to be where they were.
+            let wasAtBottomLiveFollow =
+                !terminal.userScrolling
+                && !selection.active
+                && terminal.displayBuffer.yDisp
+                    >= terminal.displayBuffer.yBase
+
             selection.active = false
             terminal.resize (cols: newCols, rows: newRows)
-            
+
+            // GALAXY: Re-pin to the bottom if reflow drifted yDisp behind
+            // yBase. yDisp >= yBase (already at or beyond the bottom) is a
+            // no-op; yDisp < yBase combined with the captured intent means
+            // reflow lost our anchor.
+            if wasAtBottomLiveFollow {
+                let buf = terminal.displayBuffer
+                if buf.yDisp < buf.yBase {
+                    buf.yDisp = buf.yBase
+                    terminal.userScrolling = false
+                }
+            }
+
             // These used to be outside
             accessibility.invalidate ()
             search.invalidate ()
-            
+
             terminalDelegate?.sizeChanged (source: self, newCols: newCols, newRows: newRows)
-           
+
             updateScroller()
             return true
         }
@@ -191,6 +226,11 @@ extension TerminalView {
         switch color {
         case .defaultColor:
             if isFg {
+                // GALAXY: Use theme-provided bold foreground color (ANSI bright
+                // white from the active theme) instead of algorithmic brightening.
+                if isBold && useBrightColors, let boldFg = galaxyBoldForegroundColor {
+                    return boldFg
+                }
                 return nativeForegroundColor
             } else {
                 return nativeBackgroundColor
@@ -332,7 +372,8 @@ extension TerminalView {
         var nsattr: [NSAttributedString.Key:Any] = [
             .font: tf,
             .foregroundColor: fg,
-            .backgroundColor: bg
+            .backgroundColor: bg,
+            .galaxyBold: isBold,  // GALAXY: carry bold state for FillStroke rendering
         ]
         if flags.contains (.underline) {
             let underlineColor = attribute.underlineColor.map {
@@ -400,7 +441,8 @@ extension TerminalView {
         var nsattr: [NSAttributedString.Key:Any] = [
             .font: tf,
             .foregroundColor: fgColor,
-            .backgroundColor: mapColor(color: bg, isFg: false, isBold: false)
+            .backgroundColor: mapColor(color: bg, isFg: false, isBold: false),
+            .galaxyBold: isBold,  // GALAXY: carry bold state for FillStroke rendering
         ]
         if flags.contains (.underline) {
             let underlineColor = attribute.underlineColor.map {
@@ -575,7 +617,8 @@ extension TerminalView {
             // Renders block elements independently of the font
             // U+2580...U+259F
             } else if customBlockGlyphs,
-                      (ch.code > BlockElementMapping.lowerBoundary && ch.code < BlockElementMapping.upperBoundary),
+                      ch.code >= BlockElementMapping.lowerBoundary,
+                      ch.code <= BlockElementMapping.upperBoundary,
                       let rects = BlockElementMapping.rects(for: UInt32(ch.code)) {
                 let fgColor = (currentAttributes[.foregroundColor] as? TTColor) ?? nativeForegroundColor
                 blockElements.append(BlockElementRenderItem(column: col, columnWidth: width, rects: rects, foregroundColor: fgColor))
@@ -1064,6 +1107,12 @@ extension TerminalView {
             #if os(macOS)
             context.setShouldSmoothFonts(true)
             context.setAllowsFontSmoothing(true)
+            // GALAXY: Enable FillStroke text rendering for heavier font weight.
+            // Uses the kitty terminal approach: stroke glyph outlines while filling
+            // to thicken text, compensating for layer-backed view thinning.
+            // Set to 0.0 to disable. Typical range: 0.2-0.75.
+            let galaxyFontThickenAmount: CGFloat = 0.3
+            let galaxyBoldExtraThicken: CGFloat = 0.3
             #endif
 
             for segment in lineInfo.segments {
@@ -1111,6 +1160,10 @@ extension TerminalView {
                     }
 
                     nativeForegroundColor.set()
+                    // GALAXY: Also set stroke color for default foreground
+                    #if os(macOS)
+                    nativeForegroundColor.setStroke()
+                    #endif
 
                     if runAttributes.keys.contains(.foregroundColor) {
                         let color = runAttributes[.foregroundColor] as! TTColor
@@ -1119,8 +1172,26 @@ extension TerminalView {
                             context.setFillColorSpace(colorSpace)
                         }
                         context.setFillColor(cgColor)
+                        // GALAXY: Match stroke color to fill for FillStroke thickening
+                        #if os(macOS)
+                        context.setStrokeColor(cgColor)
+                        #endif
                     }
-                    
+
+                    // GALAXY: Apply FillStroke thickening (heavier for bold runs).
+                    // Uses .galaxyBold attribute instead of font identity because fonts
+                    // without a bold variant (e.g. Monaco) make fontSet.bold == fontSet.normal.
+                    #if os(macOS)
+                    if galaxyFontThickenAmount > 0 {
+                        let isBoldRun = (runAttributes[.galaxyBold] as? Bool) == true
+                        let thickness = isBoldRun
+                            ? galaxyFontThickenAmount + galaxyBoldExtraThicken
+                            : galaxyFontThickenAmount
+                        context.setLineWidth(thickness)
+                        context.setTextDrawingMode(.fillStroke)
+                    }
+                    #endif
+
                     CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
 
                     // Draw other attributes
@@ -1297,17 +1368,59 @@ extension TerminalView {
         }
 
         terminal.clearUpdateRange ()
-                
+
         #if os(macOS)
+        // GALAXY: getUpdateRange() returns dirty rows in TERMINAL-row
+        // coordinates anchored to yBase + cursor.y. The view renders
+        // with bufferOffset = yDisp; when the user is scrolled up
+        // (yDisp < yBase), terminal row N corresponds to viewport row
+        // N + (yBase - yDisp). Without compensating for this offset,
+        // every in-place cell write — animated spinners, status-bar
+        // updates, anything that doesn't trigger a full scroll —
+        // invalidates the wrong screen rows. AppKit redraws stale
+        // cells (drawTerminalContents reads buffer at yDisp + screenRow,
+        // which hasn't changed for those rows) while the actually-
+        // changed cell at viewport row N + (yBase - yDisp) stays
+        // unpainted until something forces a full-bounds invalidation
+        // (a click, a session switch, a `\n` that calls
+        // `terminal.refresh(0, rows-1)` and dirties the whole screen).
+        // Compensating for the offset corrects the screen-row
+        // calculation so partial-region invalidation works while
+        // scrolled up.
+        let buffer = terminal.displayBuffer
+        let viewportOffset = buffer.yBase - buffer.yDisp
+        let viewportRowStart = max(0, rowStart + viewportOffset)
+        let viewportRowEnd = min(
+            terminal.rows - 1, rowEnd + viewportOffset
+        )
+        // If the entire dirty range has drifted below the viewport
+        // (cursor row + offset > rows-1), there's nothing to paint
+        // here. Drop through to the function's normal completion
+        // path so pendingDisplay still resets and the next feed
+        // schedules fresh.
+        guard viewportRowEnd >= viewportRowStart else {
+            pendingDisplay = false
+            updateDebugDisplay()
+            if (notifyAccessibility) {
+                accessibility.invalidate()
+                NSAccessibility.post(element: self, notification: .valueChanged)
+                NSAccessibility.post(element: self, notification: .selectedTextChanged)
+            }
+            return
+        }
+
         let baseLine = frame.height
         var region = CGRect (x: 0,
-                             y: baseLine - (cellDimension.height + CGFloat(rowEnd) * cellDimension.height),
+                             y: baseLine - (cellDimension.height + CGFloat(viewportRowEnd) * cellDimension.height),
                              width: frame.width,
-                             height: CGFloat(rowEnd-rowStart + 1) * cellDimension.height)
-        
-        // If we are the last line, we should also queue a refresh for the "remaining" bits at the
-        // end which can be redrawn by large unicode
-        if rowEnd == terminal.rows - 1 {
+                             height: CGFloat(viewportRowEnd-viewportRowStart + 1) * cellDimension.height)
+
+        // If we are the last viewport line, we should also queue a refresh
+        // for the "remaining" bits at the end which can be redrawn by
+        // large unicode. Check viewport row (not terminal row) so the
+        // "remaining bits" extension only fires when the dirty range
+        // genuinely reaches the bottom of the visible viewport.
+        if viewportRowEnd == terminal.rows - 1 {
             let oh = region.height
             let oy = region.origin.y
             region = CGRect (x: 0, y: 0, width: frame.width, height: oh + oy)
@@ -1471,13 +1584,12 @@ extension TerminalView {
     
     public func scroll (toPosition: Double)
     {
-        userScrolling = true
         let displayBuffer = terminal.displayBuffer
         let oldPosition = displayBuffer.yDisp
-        
+
         let maxScrollback = displayBuffer.lines.count - displayBuffer.rows
         var newScrollPosition = Int (Double (maxScrollback) * toPosition)
-        
+
         if newScrollPosition < 0 {
             newScrollPosition = 0
         }
@@ -1488,18 +1600,20 @@ extension TerminalView {
         if newScrollPosition != oldPosition {
             scrollTo(row: newScrollPosition)
         }
-        userScrolling = false
     }
-    
+
+    /// Scrolls the viewport so that `row` becomes the top displayed line.
+    /// Updates `userScrolling` based on whether the resulting position is
+    /// at the bottom of the buffer.
     func scrollTo (row: Int, notifyAccessibility: Bool = true)
     {
         let displayBuffer = terminal.displayBuffer
         if row != displayBuffer.yDisp {
             terminal.setViewYDisp (row)
-            
+
             // tell the terminal we want to refresh all the rows
             terminal.refresh (startRow: 0, endRow: terminal.rows)
-            
+
             // do the display update
             updateDisplay (notifyAccessibility: notifyAccessibility)
             //selectionView.notifyScrolled(source: terminal)
@@ -1507,8 +1621,25 @@ extension TerminalView {
             updateScroller()
             setNeedsDisplay(frame)
         }
+
+        // GALAXY: Update the terminal's userScrolling flag based on whether
+        // the viewport is at the bottom. When the user scrolls up, this
+        // prevents Terminal.scroll() from snapping yDisp back to yBase
+        // on each new line of output. Cleared when the user scrolls
+        // back to the bottom, resuming auto-follow behavior.
+        //
+        // Don't update userScrolling while a selection is active.
+        // selectionChanged owns userScrolling during selection — it
+        // freezes the viewport on selection start and evaluates scroll
+        // position on selection clear. Without this guard, scrollTo
+        // (called by auto-scroll during drag, or trackpad scrolling
+        // during selection) would override the freeze.
+        let atBottom = displayBuffer.yDisp >= displayBuffer.yBase
+        if !selection.active {
+            terminal.userScrolling = !atBottom
+        }
     }
-    
+
     /// Scrolls the content of the terminal one page up
     public func pageUp()
     {
@@ -1547,13 +1678,46 @@ extension TerminalView {
     func feedPrepare()
     {
         search.invalidate()
-        selection.active = false
+        // GALAXY: Recover from stuck userScrolling before the feed
+        // runs. A transient selection (click-drag that clears before
+        // the next data chunk) can leave userScrolling true while the
+        // viewport is still at the bottom. Clearing it here ensures
+        // Terminal.scroll() keeps yDisp tracking yBase during this
+        // feed. Only fires when at bottom with no active selection —
+        // genuine scroll-up (yDisp < yBase) is not affected.
+        if !selection.active && terminal.userScrolling {
+            let buf = terminal.displayBuffer
+            if buf.yDisp >= buf.yBase {
+                terminal.userScrolling = false
+            }
+        }
+        // GALAXY: Only clear selection when following live output.
+        // When the user has scrolled up or has an active selection,
+        // incoming data goes to yBase+y (beyond the frozen viewport)
+        // and doesn't affect the visible content under the selection.
+        if !terminal.userScrolling {
+            selection.active = false
+        }
+        preFeedLinesTop = terminal.buffer.linesTop
         startDisplayUpdates()
     }
-    
+
     func feedFinish ()
     {
         suspendDisplayUpdates ()
+
+        // GALAXY: Adjust selection rows for any lines trimmed during
+        // feed. When the circular buffer is full, each scroll() call
+        // recycles the oldest line, shifting all indices by -1.
+        // linesTop increments on each trim, so the delta tells us
+        // how many lines were removed.
+        if selection.active {
+            let trimmed = terminal.buffer.linesTop - preFeedLinesTop
+            if trimmed > 0 {
+                selection.adjustForTrimmedLines(trimmed)
+            }
+        }
+
         queuePendingDisplay()
     }
     
@@ -1573,33 +1737,10 @@ extension TerminalView {
         feedFinish()
     }
          
-    /**
-     * Triggers a resize of the underlying terminal to the desired columsn and rows
-     */
-    public func resize (cols: Int, rows: Int)
-    {
-        terminal.resize (cols: cols, rows: rows)
-        sizeChanged (source: terminal)
-        terminal.softReset()
-    }
-    
-    /**
-     * Sends the specified slice of byte arrays to the program running under the terminal emulator
-     * - Parameter data: the slice of an array to send to the client
-     */
-    public func send(data: ArraySlice<UInt8>)
-    {
-        ensureCaretIsVisible ()
-        #if os(iOS) || os(visionOS)
-        if TerminalView.textInputDebugEnabled {
-            let previewBytes = data.prefix(32).map { String(format: "%02X", $0) }.joined(separator: " ")
-            print("UITextInput[\(TerminalView.textInputLogCounter + 1)]: send bytes=\(data.count) [\(previewBytes)]")
-            TerminalView.textInputLogCounter += 1
-        }
-        #endif
-        terminalDelegate?.send (source: self, data: data)
-    }
-    
+    // GALAXY: resize(cols:rows:) and send(data:) relocated to
+    // MacTerminalView.swift class body (marked open) so subclasses
+    // in other modules can override them.
+
     /**
      * Sends the specified string encoded at utf8 to the program running under the terminal emulator
      * - Parameter txt: the string to send to the client
