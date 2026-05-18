@@ -38,7 +38,11 @@ class CircularList<T> {
             if maxLength != oldValue {
                 let empty : T? = nil
                 var newArray = Array(repeating: empty, count:Int(maxLength))
-                let top = min (maxLength, array.count)
+                // GALACTIC PATCH: Copy only _count live entries, not array.count.
+                // The upstream code used min(maxLength, array.count) which copies
+                // zombie entries left behind by trimStart into the new array,
+                // preventing ARC from freeing them. Do not revert to array.count.
+                let top = min (_count, maxLength)
                 for i in 0..<top {
                     newArray [i] = array [getCyclicIndex(i)]
                 }
@@ -158,9 +162,18 @@ class CircularList<T> {
         }
      }
 
+    // GALACTIC PATCH: Memory-critical — trimStart must nil vacated slots.
+    // Without this, every ESC[3J (clear scrollback) leaves ~10K BufferLine
+    // objects (~4KB each) alive as zombies in the backing array. Over a
+    // long session with repeated clears, this accumulates 400+ MB of
+    // unreachable-but-referenced heap. The nilling loop is the fix.
+    // Do not remove it or replace it with the upstream version.
     func trimStart (count: Int)
     {
         let c = count > self.count ? self.count : count
+        for i in 0..<c {
+            array [(startIndex + i) % array.count] = nil
+        }
         startIndex = startIndex + c
         self.count -= count
     }
@@ -216,10 +229,10 @@ class CircularList<T> {
     }
 }
 
-internal class CircularBufferLineList {
+public class CircularBufferLineList {
     private var array: [BufferLine?]
     private var startIndex: Int
-    var count: Int {
+    public var count: Int {
         get {
             return _count
         }
@@ -251,7 +264,9 @@ internal class CircularBufferLineList {
             if maxLength != oldValue {
                 let empty : BufferLine? = nil
                 var newArray = Array(repeating: empty, count:Int(maxLength))
-                let top = min (maxLength, array.count)
+                // GALACTIC PATCH: Copy only _count live entries, not array.count.
+                // See the matching comment on CircularList<T>.maxLength above.
+                let top = min (_count, maxLength)
                 for i in 0..<top {
                     newArray [i] = array [getCyclicIndex(i)]
                 }
@@ -293,7 +308,7 @@ internal class CircularBufferLineList {
         return getCyclicIndex(index)
     }
 
-    subscript (index: Int) -> BufferLine {
+    public subscript (index: Int) -> BufferLine {
         _read {
             let idx = getCyclicIndex(index)
             if array[idx] == nil {
@@ -380,9 +395,20 @@ internal class CircularBufferLineList {
         }
      }
 
+    // GALACTIC PATCH: Memory-critical — trimStart must nil vacated slots.
+    // This is the primary fix for the SwiftTerm scrollback memory leak.
+    // Each BufferLine holds a ContiguousArray<CharData> (~4KB). Without
+    // nilling, ESC[3J clears advance startIndex but leave the old
+    // BufferLine references alive in the backing array. Over repeated
+    // clear/refill cycles in a Claude session, this leaked 400+ MB.
+    // See CircularList<T>.trimStart above for the generic counterpart.
+    // Do not remove the nilling loop or replace with the upstream version.
     func trimStart (count: Int)
     {
         let c = count > self.count ? self.count : count
+        for i in 0..<c {
+            array [(startIndex + i) % array.count] = nil
+        }
         startIndex = startIndex + c
         self.count -= count
     }

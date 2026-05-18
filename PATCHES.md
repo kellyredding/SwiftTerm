@@ -10,6 +10,36 @@ This file is part of commit 4 (the Galactic customization commit) in
 the four-commit `main` structure described in `MAINTAINING.md`. It
 grows by one entry per upstream bump.
 
+## v1.13.0-galactic.7 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream (no
+version bump) to add the caret patches below.
+
+Note: `.5` and `.6` were prior re-cuts against this same upstream and did
+not receive PATCHES entries — `.6` added the `scrollTo` reorder (sets
+`userScrolling` before invalidating the view, closing the
+following-but-drifted transient). `.7` carries everything `.6` had plus
+the caret patches below.
+
+### Patches added in this revision
+
+- **Caret reposition on focus gain** — `becomeFirstResponder` and the
+  `NSWindowDidBecomeMainNotification` handler now call
+  `updateCursorPosition()` after restyling. Focus-gain alone restyled the
+  caret (shape/blink) but never repositioned it, so a cursor that moved
+  while the window was unfocused painted at a stale cell until the next
+  output. Repositioning on focus eliminates that drift.
+- **`repositionCaret()` public method** — public wrapper over the internal
+  `updateCursorPosition()` on `AppleTerminalView`, so a Galactic subclass
+  can force a caret reposition after it mutates the viewport (e.g. snapping
+  to the live bottom on focus), where the internal display cycle would
+  otherwise leave the caret frame stale until the next output.
+
+### Verification
+
+- `swift build` on the fork passes.
+- Galactic smoke test on `v1.13.0-galactic.7`: (filled in Phase 2).
+
 ## v1.13.0-galactic.4 — upstream v1.13.0
 
 Base: upstream `migueldeicaza/SwiftTerm` at tag `v1.13.0`.

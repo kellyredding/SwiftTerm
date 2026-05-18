@@ -18,6 +18,100 @@ import Carbon.HIToolbox
 import MetalKit
 #endif
 
+// GALACTIC: Theme-independent scroller — transparent track with a neutral gray knob.
+// Overrides NSScroller drawing so the terminal background shows through regardless
+// of the app's light/dark appearance setting.
+class GalacticScroller: NSScroller {
+    override func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {
+        // Intentionally empty — no track background, terminal shows through.
+    }
+
+    override func drawKnob() {
+        let knobRect = rect(for: .knob)
+        guard knobRect.height > 4 else { return }
+
+        // Inset horizontally for a narrower pill, leave vertical edges flush
+        let pillRect = knobRect.insetBy(dx: 3, dy: 1)
+        let radius = min(pillRect.width, pillRect.height) / 2
+        let path = NSBezierPath(roundedRect: pillRect, xRadius: radius, yRadius: radius)
+        NSColor(white: 0.5, alpha: 0.50).setFill()
+        path.fill()
+    }
+
+    // GALACTIC: Cursor affordances over the scrollbar. The track shows a
+    // pointing hand — clicking it pages/jumps the view — while the knob
+    // shows a grab hand: open on hover, closed while dragging.
+    //
+    // The tracking area opts into BOTH .cursorUpdate and .mouseMoved.
+    // .cursorUpdate alone only fires when the cursor crosses the area's
+    // outer boundary, so moving from the track onto the knob (both inside
+    // the same area) wouldn't re-evaluate and the knob kept the track's
+    // pointing hand. .mouseMoved fires continuously inside the area, so the
+    // live knob hit-test re-runs on every move — which also lets the knob
+    // region follow the knob as it scrolls, with no stale cursor rect.
+    private var cursorTrackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = cursorTrackingArea {
+            removeTrackingArea(existing)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.cursorUpdate, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        )
+        cursorTrackingArea = area
+        addTrackingArea(area)
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        applyScrollbarCursor(for: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        // Don't forward to super: the parent terminal view runs its own
+        // .mouseMoved tracking area for mouse reporting, so forwarding would
+        // double-deliver. We only need the per-move knob hit-test here.
+        applyScrollbarCursor(for: event)
+    }
+
+    /// Open hand over the knob, pointing hand over the rest of the track,
+    /// hit-tested against the knob's current position.
+    private func applyScrollbarCursor(for event: NSEvent) {
+        let windowPoint = event.locationInWindow
+        // The tracking area keeps firing while another view is layered over
+        // us (e.g. a scrollback overlay with its own scroller), since
+        // tracking areas ignore occlusion. Only drive the cursor when we are
+        // actually the front-most view at the pointer; otherwise the hand
+        // would bleed through the overlay and fight its scroller. mouseDown
+        // needs no such guard — AppKit hit-tests clicks to the top view.
+        guard let hit = window?.contentView?.hitTest(windowPoint),
+              hit.isDescendant(of: self)
+        else { return }
+        let point = convert(windowPoint, from: nil)
+        if rect(for: .knob).contains(point) {
+            NSCursor.openHand.set()
+        } else {
+            NSCursor.pointingHand.set()
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // Closed hand only while dragging the knob; a track click keeps the
+        // pointing hand. super.mouseDown runs the scroller's modal tracking
+        // loop until mouseUp, so push/pop the cursor around it.
+        let point = convert(event.locationInWindow, from: nil)
+        if rect(for: .knob).contains(point) {
+            NSCursor.closedHand.push()
+            defer { NSCursor.pop() }
+            super.mouseDown(with: event)
+        } else {
+            super.mouseDown(with: event)
+        }
+    }
+}
+
 /**
  * TerminalView provides an AppKit front-end to the `Terminal` termininal emulator.
  * It is up to a subclass to either wire the terminal emulator to a remote terminal
@@ -141,15 +235,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
 #endif
 
-    var cellDimension: CellDimension!
-    var caretView: CaretView!
+    // GALACTIC: public so ScrollbackTerminalView can compute frozen col width
+    public var cellDimension: CellDimension!
+    public var caretView: CaretView!
     public var terminal: Terminal!
     private var progressBarView: TerminalProgressBarView?
     private var progressReportTimer: Timer?
     private var lastProgressValue: UInt8?
 
-    var selection: SelectionService!
-    private var scroller: NSScroller!
+    public var selection: SelectionService!
+    private var scroller: GalacticScroller!
+    // GALACTIC: Tracks linesTop before each feed to detect buffer trims
+    var preFeedLinesTop: Int = 0
     
     // Attribute dictionary, maps a console attribute (color, flags) to the corresponding dictionary
     // of attributes for an NSAttributedString
@@ -322,6 +419,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     func setupFocusNotification() {
         becomeMainObserver = NotificationCenter.default.addObserver(forName: .init("NSWindowDidBecomeMainNotification"), object: nil, queue: nil) { [unowned self] notification in
             self.caretView.updateCursorStyle()
+            // Reposition on app refocus: the cursor may have moved while the
+            // window was inactive, and restyling alone leaves the caret at its
+            // stale cell until the next output (see updateCursorPosition).
+            self.updateCursorPosition()
         }
         resignMainObserver = NotificationCenter.default.addObserver(forName: .init("NSWindowDidResignMainNotification"), object: nil, queue: nil) { [unowned self] notification in
             self.caretView.disableAnimations()
@@ -429,12 +530,21 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             settingBg = true
             _nativeBg = newValue
             terminal.backgroundColor = nativeBackgroundColor.getTerminalColor ()
+            // GALACTIC: Sync the CALayer background so empty areas above content
+            // update when the background color changes (e.g. via OSC 11 or theme switch).
+            layer?.backgroundColor = newValue.cgColor
             settingBg = false
         }
     }
     
     /// Controls weather to use high ansi colors, if false terminal will use bold text instead of high ansi colors
     public var useBrightColors: Bool = true
+
+    // GALACTIC: Bold foreground color from the active terminal color theme.
+    // Set to the theme's bright white (ANSI 15) so bold text uses
+    // theme-designed colors instead of algorithmic brightening.
+    // When nil, bold default foreground renders the same as non-bold.
+    public var galacticBoldForegroundColor: NSColor?
 
     /// When true, block element (U+2580-U+259F) and box drawing (U+2500-U+257F) characters use custom rendering.
     public var customBlockGlyphs: Bool = true {
@@ -484,6 +594,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     @objc
     func scrollerActivated ()
     {
+        holdScroller()  // GALACTIC: Keep visible while interacting
         switch scroller.hitPart {
         case .decrementPage:
             pageUp()
@@ -504,9 +615,21 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         default:
             print ("Scroller: New value introduced")
         }
+        releaseScroller()  // GALACTIC: Schedule hide after interaction ends
     }
 
     let scrollerStyle: NSScroller.Style = .legacy
+
+    // GALACTIC: Auto-hide scroller — starts hidden, shows on scroll/hover, fades after delay.
+    private var scrollerHideTimer: Timer?
+    private static let scrollerHideDelay: TimeInterval = 0.5
+    private var scrollerTrackingArea: NSTrackingArea?
+
+    // GALACTIC: Throttle terminal resize during live window drag to avoid
+    // expensive reflow on every pixel. Coalesces to ~30fps during drag,
+    // processes the final size immediately when drag ends.
+    private var pendingResizeSize: NSSize?
+    private var resizeThrottleWork: DispatchWorkItem?
 
     func getScrollerFrame() -> CGRect {
         let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: scrollerStyle)
@@ -516,8 +639,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     func setupScroller()
     {
         if scroller == nil {
-            scroller = NSScroller(frame: .zero)
+            // GALACTIC: GalacticScroller (custom NSScroller subclass with transparent
+            // track and pill-shaped knob) layered into upstream's Auto Layout
+            // wiring. Start hidden — flashScroller/auto-hide controls visibility.
+            scroller = GalacticScroller(frame: .zero)
             scroller.translatesAutoresizingMaskIntoConstraints = false
+            scroller.alphaValue = 0  // GALACTIC: Start hidden
             addSubview(scroller)
 
             // Use Auto Layout to position the scroller. This ensures correct layout
@@ -537,10 +664,69 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         scroller.action = #selector(scrollerActivated)
         scroller.target = self
+        setupScrollerTrackingArea()
     }
 
     func updateScrollerFrame() {
-        // Scroller position is managed by Auto Layout constraints
+        // GALACTIC: Upstream Auto Layout manages the scroller's frame via
+        // constraints; we just refresh the hover tracking area to match
+        // the new bounds.
+        setupScrollerTrackingArea()
+    }
+
+    // GALACTIC: Tracking area over the scroller region for hover detection
+    private func setupScrollerTrackingArea() {
+        if let existing = scrollerTrackingArea {
+            removeTrackingArea(existing)
+        }
+        // Widen the hover zone slightly beyond the scroller for easier targeting
+        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: scrollerStyle)
+        let hoverWidth = scrollerWidth + 20
+        let hoverRect = NSRect(x: bounds.maxX - hoverWidth, y: 0, width: hoverWidth, height: bounds.height)
+        let area = NSTrackingArea(
+            rect: hoverRect,
+            options: [.mouseEnteredAndExited, .activeInKeyWindow],
+            owner: self,
+            userInfo: ["galacticScroller": true]
+        )
+        scrollerTrackingArea = area
+        addTrackingArea(area)
+    }
+
+    /// Show the scroller with a fade-in and schedule auto-hide
+    func flashScroller() {
+        guard canScroll else { return }
+        scrollerHideTimer?.invalidate()
+        scrollerHideTimer = nil
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            scroller.animator().alphaValue = 1
+        }
+        scheduleScrollerHide()
+    }
+
+    /// Schedule the scroller to fade out after the delay
+    private func scheduleScrollerHide() {
+        scrollerHideTimer?.invalidate()
+        scrollerHideTimer = Timer.scheduledTimer(withTimeInterval: Self.scrollerHideDelay, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.4
+                self.scroller.animator().alphaValue = 0
+            }
+        }
+    }
+
+    /// Keep the scroller visible (cancel hide timer) while interacting
+    private func holdScroller() {
+        scrollerHideTimer?.invalidate()
+        scrollerHideTimer = nil
+        scroller.alphaValue = 1
+    }
+
+    /// Release the hold and schedule hide
+    private func releaseScroller() {
+        scheduleScrollerHide()
     }
 
     /// This method sents the `nativeForegroundColor` and `nativeBackgroundColor`
@@ -571,7 +757,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return NSRect (x: 0, y: 0, width: cellDimension.width * CGFloat(terminal.cols) + scrollerWidth, height: cellDimension.height * CGFloat(terminal.rows))
     }
 
-    func getEffectiveWidth (size: CGSize) -> CGFloat
+    // GALACTIC: open so ScrollbackTerminalView can freeze column count
+    open func getEffectiveWidth (size: CGSize) -> CGFloat
     {
         return (size.width - scrollerWidth)
     }
@@ -583,8 +770,16 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func linefeed(source: Terminal) {
-        // Preserve manual selection while output is streaming when mouse reporting is disabled.
-        if allowMouseReporting {
+        // GALACTIC: Only clear selection when following live output.
+        // This delegate fires for every \n inside terminal.feed(buffer:),
+        // between feedPrepare and feedFinish. Without this guard, the
+        // first newline in any data chunk would kill the selection even
+        // if feedPrepare preserved it. For interactive typing, keyDown
+        // already clears selection before the Enter-echo linefeed
+        // arrives, so this guard doesn't change interactive behavior.
+        // Supersedes upstream's allowMouseReporting-gated clear — same
+        // reasoning as in feedPrepare in AppleTerminalView.swift.
+        if !terminal.userScrolling {
             selection.selectNone()
         }
     }
@@ -677,7 +872,28 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         updateScrollerFrame()
         updateProgressBarFrame()
         guard cellDimension != nil else { return }
-        _ = processSizeChange(newSize: frame.size)
+
+        // GALACTIC: Throttle terminal resize during live window drag.
+        // The expensive reflow iterates all scrollback lines on every column
+        // change — coalescing to ~30fps keeps the drag smooth. Upstream's
+        // Metal redraw dispatch below runs every call (cheap), separate
+        // from the throttled CPU-side reflow.
+        if inLiveResize {
+            pendingResizeSize = frame.size
+            if resizeThrottleWork == nil {
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self, let size = self.pendingResizeSize else { return }
+                    self.pendingResizeSize = nil
+                    self.resizeThrottleWork = nil
+                    _ = self.processSizeChange(newSize: size)
+                }
+                resizeThrottleWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.032, execute: work)
+            }
+        } else {
+            _ = processSizeChange(newSize: frame.size)
+        }
+
 #if canImport(MetalKit)
         if useMetalRenderer {
             if inLiveResize && TerminalView.metalLiveResizeThrottleEnabled {
@@ -692,6 +908,16 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         needsDisplay = true
 #endif
         updateCursorPosition()
+    }
+
+    open override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        resizeThrottleWork?.cancel()
+        resizeThrottleWork = nil
+        if let size = pendingResizeSize {
+            pendingResizeSize = nil
+            _ = processSizeChange(newSize: size)
+        }
     }
 
     public override func resizeSubviews(withOldSize oldSize: NSSize) {
@@ -716,17 +942,23 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     //
     // NSTextInputClient protocol implementation
     //
-    public override func becomeFirstResponder() -> Bool {
+    open override func becomeFirstResponder() -> Bool {
         let response = super.becomeFirstResponder()
         if response {
             hasFocus = true
             caretView.updateCursorStyle()
+            // The caret frame is only recomputed in updateCursorPosition (via
+            // updateDisplay); focus-gain alone restyles the caret but never
+            // repositions it. If the cursor moved while we were unfocused, the
+            // caret paints at a stale cell until the next output — reposition
+            // on focus to kill that drift.
+            updateCursorPosition()
             terminal.setTerminalFocus(true)
         }
         return response
     }
     
-    public override func resignFirstResponder() -> Bool {
+    open override func resignFirstResponder() -> Bool {
         let response = super.resignFirstResponder()
         if response {
             caretView.disableAnimations()
@@ -867,6 +1099,15 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         super.flagsChanged(with: event)
     }
     
+    // GALACTIC: Show scroller when mouse enters the right-edge tracking area
+    public override func mouseEntered(with event: NSEvent) {
+        if let userData = event.trackingArea?.userInfo as? [String: Any],
+           userData["galacticScroller"] != nil {
+            holdScroller()
+        }
+        super.mouseEntered(with: event)
+    }
+
     public override func mouseExited(with event: NSEvent) {
         turnOffUrlPreview()
         if linkHighlightMode == .hover || linkHighlightMode == .hoverWithModifier {
@@ -875,8 +1116,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             invalidateLinkHighlight(oldRange: oldRange, newRange: nil)
             queuePendingDisplay()
         }
+        // GALACTIC: Schedule scroller hide when mouse leaves the right-edge zone
+        if let userData = event.trackingArea?.userInfo as? [String: Any],
+           userData["galacticScroller"] != nil {
+            releaseScroller()
+        }
         super.mouseExited(with: event)
     }
+
     
     /// If set to true, the terminal treats the "Option" key as the Meta key in old terminals,
     /// which has the effect of sending the ESC character before the character that was
@@ -907,7 +1154,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // doCommand/noop: - but more research needs to take place to figure out the priority
     // of those keys.
     //
-    public override func keyDown(with event: NSEvent) {
+    open override func keyDown(with event: NSEvent) {
         selection.active = false
         let eventFlags = event.modifierFlags
 
@@ -1869,6 +2116,26 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         #endif
         needsDisplay = true
+
+        // GALACTIC: Freeze viewport while any selection is active.
+        // This covers drag, double-click, triple-click, selectAll,
+        // and shift-extend — all selection creation paths go through
+        // setActiveAndNotify() which triggers this callback.
+        //
+        // On selection clear, evaluate current scroll position:
+        // - At the bottom (yDisp >= yBase): resume auto-follow
+        // - In scrollback (yDisp < yBase): stay frozen
+        //
+        // This means the user ends up wherever they actually are,
+        // whether they scrolled during selection or output accumulated
+        // while frozen.
+        if selection.active {
+            terminal.userScrolling = true
+        } else {
+            let displayBuffer = terminal.displayBuffer
+            let atBottom = displayBuffer.yDisp >= displayBuffer.yBase
+            terminal.userScrolling = !atBottom
+        }
     }
     
     func cut (sender: Any?) {}
@@ -1890,6 +2157,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let clipboard = NSPasteboard.general
         clipboard.clearContents()
         clipboard.setString(str, forType: .string)
+
+        // GALACTIC: Clear selection after copy. selectNone() sets
+        // active = false (triggering selectionChanged, which evaluates
+        // the current scroll position to decide whether to resume
+        // auto-follow or stay in scrollback) and resets selectionMode
+        // to .character for a clean slate. The freeze was a temporary
+        // hold to capture text — Cmd+C is the "I'm done" signal.
+        selection.selectNone()
     }
     
     public override func selectAll(_ sender: Any?)
@@ -1946,7 +2221,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     private var autoScrollDelta = 0
-    // Callback from when the mouseDown autoscrolling timer goes off
+    private var autoScrollTimer: Timer?  // GALACTIC: drives drag-to-scroll
+
+    // Callback from when the mouseDrag autoscrolling timer goes off
     private func scrollingTimerElapsed (source: Timer)
     {
         if autoScrollDelta == 0 {
@@ -1955,11 +2232,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if autoScrollDelta < 0 {
             scrollUp(lines: autoScrollDelta * -1)
         } else {
-            scrollUp(lines: autoScrollDelta)
+            scrollDown(lines: autoScrollDelta)  // GALACTIC: fixed — was scrollUp
         }
     }
     
-    public override func mouseDown(with event: NSEvent) {
+    open override func mouseDown(with event: NSEvent) {
         if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
             sharedMouseEvent(with: event)
             return
@@ -1998,7 +2275,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     var didSelectionDrag: Bool = false
     
-    public override func mouseUp(with event: NSEvent) {
+    // GALACTIC: open (not public) so cross-module subclasses can override.
+    open override func mouseUp(with event: NSEvent) {
         let hit = calculateMouseHit(with: event).grid
         updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
         if let result = linkForClick(at: hit, hasCommandModifier: event.modifierFlags.contains(.command)) {
@@ -2015,10 +2293,15 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         //print ("Up at col=\(hit.col) row=\(hit.row) count=\(event.clickCount) selection.active=\(selection.active) didSelectionDrag=\(didSelectionDrag) ")
         #endif
         
+        // GALACTIC: Stop drag-to-scroll timer on mouse release
+        autoScrollTimer?.invalidate()
+        autoScrollTimer = nil
+        autoScrollDelta = 0
+
         didSelectionDrag = false
     }
     
-    public override func mouseDragged(with event: NSEvent) {
+    open override func mouseDragged(with event: NSEvent) {
         let displayBuffer = terminal.displayBuffer
         let mouseHit = calculateMouseHit(with: event)
         let hit = mouseHit.grid
@@ -2043,14 +2326,38 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         didSelectionDrag = true
         autoScrollDelta = 0
-        let screenRow = hit.row - displayBuffer.yDisp
+        // GALACTIC: Use unclamped screen row for velocity calculation.
+        // calculateMouseHit clamps hit.row to valid buffer bounds,
+        // which destroys the distance signal when dragging below the
+        // bottom edge (clamped to last buffer row, delta is always ~0).
+        // The raw pixel-to-row conversion preserves how far past the
+        // edge the mouse actually is, giving symmetric velocity scaling
+        // for both upward and downward drags. The bottom edge gets a
+        // 4-row boost because the tab bar below the terminal limits
+        // how far the mouse can physically travel past the bottom
+        // compared to the top (title bar + menu bar give more room).
+        let point = convert(event.locationInWindow, from: nil)
+        let rawScreenRow = Int((frame.height - point.y) / cellDimension.height)
         if selection.active {
-            if screenRow <= 0 {
-                autoScrollDelta = calcScrollingVelocity(delta: screenRow * -1) * -1
-            } else if screenRow >= displayBuffer.rows {
-                autoScrollDelta = calcScrollingVelocity(delta: screenRow - displayBuffer.rows)
+            if rawScreenRow < 0 {
+                autoScrollDelta = calcAutoScrollVelocity(delta: rawScreenRow * -1) * -1
+            } else if rawScreenRow >= displayBuffer.rows {
+                let bottomBoost = 4
+                autoScrollDelta = calcAutoScrollVelocity(delta: rawScreenRow - displayBuffer.rows + bottomBoost)
             }
         }
+
+        // GALACTIC: Start/stop the auto-scroll timer based on whether the
+        // drag has moved past the terminal edge.
+        if autoScrollDelta != 0 && autoScrollTimer == nil {
+            autoScrollTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] timer in
+                self?.scrollingTimerElapsed(source: timer)
+            }
+        } else if autoScrollDelta == 0 {
+            autoScrollTimer?.invalidate()
+            autoScrollTimer = nil
+        }
+
         setNeedsDisplay(bounds)
     }
     
@@ -2153,7 +2460,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return calculateMouseHit(at: point).grid
     }
     
-    public override func mouseMoved(with event: NSEvent) {
+    open override func mouseMoved(with event: NSEvent) {
         let hit = calculateMouseHit(with: event)
         if commandActive {
             if let payload = getPayload(for: event) as? String {
@@ -2169,19 +2476,45 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
     
-    public override func scrollWheel(with event: NSEvent) {
+    /// Accumulated fractional scroll delta for smooth sub-line trackpad scrolling.
+    /// Trackpad momentum sends many small fractional deltas (e.g. 0.3, 0.7);
+    /// accumulating them prevents swallowing small gestures while keeping
+    /// discrete mouse-wheel clicks (which send integer deltas) responsive.
+    private var scrollDeltaAccumulator: CGFloat = 0
+
+    open override func scrollWheel(with event: NSEvent) {
         if event.deltaY == 0 {
             return
         }
-        let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
-        if event.deltaY > 0 {
-            scrollUp (lines: velocity)
+
+        // GALACTIC: Show scroller on any scroll gesture
+        flashScroller()
+
+        // Reset accumulator when a new gesture begins (trackpad touch-down)
+        if event.phase == .began || event.momentumPhase == .began {
+            scrollDeltaAccumulator = 0
+        }
+
+        // Accumulate the delta and consume whole lines
+        scrollDeltaAccumulator += event.deltaY
+        let lines = Int(scrollDeltaAccumulator)
+        if lines == 0 {
+            return  // Not enough accumulated for a full line yet
+        }
+        scrollDeltaAccumulator -= CGFloat(lines)
+
+        if lines > 0 {
+            scrollUp(lines: lines)
         } else {
-            scrollDown(lines: velocity)
+            scrollDown(lines: -lines)
         }
     }
     
-    private func calcScrollingVelocity (delta: Int) -> Int
+    /// Velocity for auto-scrolling during selection drag past the terminal edge.
+    /// The curve is tuned so that even barely past the edge (delta 1) gives
+    /// noticeable speed — important because there's less physical mouse travel
+    /// below the terminal (window edge, dock) than above it (title bar, menu bar).
+    private func calcAutoScrollVelocity (delta: Int) -> Int
     {
         if delta > 9 {
             return max (terminal.rows, 20)
@@ -2189,12 +2522,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if delta > 5 {
             return 10
         }
-        if delta > 1 {
-            return 3
+        if delta > 2 {
+            return 5
         }
-        return 1
+        return 3
     }
-    
+
     public override func resetCursorRects() {
         addCursorRect(bounds, cursor: .iBeam)
     }
@@ -2409,6 +2742,31 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     public func iTermContent (source: Terminal, content: ArraySlice<UInt8>) {
         terminalDelegate?.iTermContent(source: self, content: content)
     }
+
+    // GALACTIC: Relocated from extension TerminalView in AppleTerminalView.swift
+    // so subclasses in other modules can override. Swift does not allow
+    // cross-module override of non-@objc extension methods.
+
+    /**
+     * Triggers a resize of the underlying terminal to the desired columns and rows
+     */
+    open func resize (cols: Int, rows: Int)
+    {
+        terminal.resize (cols: cols, rows: rows)
+        sizeChanged (source: terminal)
+        terminal.softReset()
+    }
+
+    /**
+     * Sends the specified slice of byte arrays to the program running under the terminal emulator
+     * - Parameter data: the slice of an array to send to the client
+     */
+    open func send(data: ArraySlice<UInt8>)
+    {
+        ensureCaretIsVisible ()
+        terminalDelegate?.send (source: self, data: data)
+    }
+
 }
 
 
