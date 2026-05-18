@@ -166,36 +166,199 @@ public class LocalProcess {
         }
     }
     
+    // MARK: - GALACTIC PATCH: ordered, complete writes with a completion signal
+    //
+    // Three defects in one function, all of which a caller feels as a prompt
+    // that arrived wrong rather than as an error:
+    //
+    // 1. A short write dropped its remainder. `DispatchIO.write` hands the
+    //    handler the bytes it could NOT write, and the handler ignored that
+    //    parameter — so anything the kernel declined was lost. A pty in raw
+    //    mode accepts about 1022 bytes when the child is not draining
+    //    (MEASURED on macOS 15), which is well inside the size of a composed
+    //    prompt, so a prompt written to a busy child lost its tail.
+    // 2. `total` was advanced by the whole count regardless of how much was
+    //    written, so the one number that could have exposed 1 was wrong in
+    //    exactly the case that mattered.
+    // 3. Every call issued an independent one-shot write on a CONCURRENT
+    //    global queue, so two sends had no order relative to each other. Two
+    //    prompts written close together interleaved their bytes.
+    //
+    // Writes are now serialized on a queue of this process's own and each is
+    // carried to completion — retrying the remainder the kernel declined —
+    // before the next begins. `completion` reports when the bytes are
+    // genuinely gone, which is the signal a caller needs to know when a
+    // following keystroke can be sent: no fixed delay can answer that,
+    // because how fast the child drains depends on what the child is doing.
+    // `DispatchIO.write` is not the primitive for this, which is the second
+    // thing MEASURED here and the reason this patch is a rewrite rather than a
+    // guard. Handed more than a pty's input queue can take, it never called
+    // its handler at all — not with a remainder, not with an error — while the
+    // tty rang the bell once per rejected byte. So it can neither be asked how
+    // much it wrote nor relied on to say it finished.
+    //
+    // Explicit writes on a queue of this process's own answer both. Chunks are
+    // kept well under the queue's capacity so a single write never trips the
+    // overflow that discards and beeps, and the loop simply carries on where
+    // the kernel left off.
+    private let writeQueue = DispatchQueue(
+        label: "swiftterm.localprocess.write")
+
+    /// Queued sends, oldest first. Only `writeQueue` touches this.
+    private var writeBacklog: [(data: [UInt8], completion: ((Bool) -> Void)?)] = []
+    private var writeInFlight = false
+
+    /// Comfortably inside the ~1022 bytes a raw-mode pty was measured to take,
+    /// so no single write can reach the overflow path.
+    private static let writeChunkSize = 256
+
     /**
      * Sends the array slice to the local process using DispatchIO
      * - Parameter data: The range of bytes to send to the child process
      */
     public func send (data: ArraySlice<UInt8>)
     {
+        send(data: data, completion: nil)
+    }
+
+    /**
+     * Sends the array slice to the local process, reporting when every byte
+     * has been written.
+     * - Parameter data: The range of bytes to send to the child process
+     * - Parameter completion: called with `true` once all bytes have been
+     *   written, or `false` if the write failed or the process went away.
+     *   Delivered on the queue this process posts delegate callbacks to —
+     *   the main queue unless the host supplied another.
+     */
+    public func send (data: ArraySlice<UInt8>, completion: ((Bool) -> Void)?)
+    {
         guard running else {
+            if let completion { dispatchQueue.async { completion(false) } }
             return
         }
+        let bytes = Array(data)
+        writeQueue.async { [weak self] in
+            guard let self else {
+                if let completion { DispatchQueue.main.async { completion(false) } }
+                return
+            }
+            self.writeBacklog.append((bytes, completion))
+            self.pumpWrites()
+        }
+    }
+
+    /// Start the next queued write, if one is not already running.
+    ///
+    /// `writeQueue` only. One write at a time is the whole point: ordering
+    /// between two sends is not otherwise defined, and a caller that composes
+    /// a prompt out of several sends has no way to impose it from outside.
+    private func pumpWrites() {
+        guard !writeInFlight, !writeBacklog.isEmpty else { return }
+        writeInFlight = true
+        let item = writeBacklog.removeFirst()
         let copy = sendCount
         sendCount += 1
-        data.withUnsafeBytes { ptr in
-            let ddata = DispatchData(bytes: ptr)
-            let copyCount = ddata.count
-            if debugIO {
-                print ("[SEND-\(copy)] Queuing data to client: \(data) ")
-            }
+        if debugIO {
+            print ("[SEND-\(copy)] Queuing data to client: \(item.data.count) bytes")
+        }
+        writeChunk(
+            item.data, offset: 0, id: copy, stalls: 0,
+            completion: item.completion)
+    }
 
-            DispatchIO.write(toFileDescriptor: childfd, data: ddata, runningHandlerOn: DispatchQueue.global(qos: .userInitiated), handler:  { dd, errno in
-                self.total += copyCount
-                if self.debugIO {
-                    print ("[SEND-\(copy)] completed bytes=\(self.total)")
-                }
-                if errno != 0 {
-                    print ("Error writing data to the child, errno=\(errno)")
-                }
-            })
+    /// Write from `offset` to the end, resuming where the kernel left off.
+    ///
+    /// `writeQueue` only. Runs until the payload is gone, the child refuses to
+    /// take any of it, or an error says stop. `stalls` bounds only the
+    /// pathological case — a child that has stopped reading entirely — and is
+    /// reset by any progress at all, so a large payload against a merely slow
+    /// child takes as many rounds as it needs rather than being given up on.
+    private func writeChunk(
+        _ data: [UInt8], offset: Int, id: Int, stalls: Int,
+        completion: ((Bool) -> Void)?
+    ) {
+        guard running, childfd >= 0 else {
+            if debugIO {
+                print ("[SEND-\(id)] abandoned at \(offset) of \(data.count)")
+            }
+            finishWrite(false, completion: completion)
+            return
         }
 
+        var at = offset
+        while at < data.count {
+            let count = min(Self.writeChunkSize, data.count - at)
+            let n = data[at..<(at + count)].withUnsafeBytes { buf in
+                Foundation.write(childfd, buf.baseAddress, buf.count)
+            }
+            if n > 0 {
+                at += n
+                total += n
+                continue
+            }
+            if n < 0, errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR {
+                break
+            }
+            print ("Error writing data to the child, errno=\(errno)")
+            if debugIO {
+                print ("[SEND-\(id)] failed at \(at) of \(data.count)")
+            }
+            finishWrite(false, completion: completion)
+            return
+        }
+
+        if at >= data.count {
+            if debugIO {
+                print ("[SEND-\(id)] completed bytes=\(total)")
+            }
+            finishWrite(true, completion: completion)
+            return
+        }
+
+        // The child is not taking any more right now. Wait rather than spin:
+        // the queue drains as it reads, and there is nothing to do until then.
+        let progressed = at > offset
+        let nextStalls = progressed ? 0 : stalls + 1
+        guard nextStalls <= Self.maxStalledWriteAttempts else {
+            if debugIO {
+                print ("[SEND-\(id)] gave up at \(at) of \(data.count)")
+            }
+            finishWrite(false, completion: completion)
+            return
+        }
+        writeQueue.asyncAfter(deadline: .now() + Self.stalledWriteRetryDelay) {
+            [weak self] in
+            guard let self else {
+                if let completion { DispatchQueue.main.async { completion(false) } }
+                return
+            }
+            self.writeChunk(
+                data, offset: at, id: id, stalls: nextStalls,
+                completion: completion)
+        }
     }
+
+    /// `writeQueue` only. Release the lane and start whatever is behind.
+    ///
+    /// The completion is posted to `dispatchQueue` — the same queue delegate
+    /// callbacks go to, the main one unless a host said otherwise — and not
+    /// called here. A caller's closure belongs to the caller's context: in a
+    /// host built with Swift's concurrency checking, one written where the
+    /// rest of the UI lives is main-actor isolated, and calling it on this
+    /// queue trips the isolation assertion and takes the process down. Found
+    /// exactly that way.
+    private func finishWrite(_ ok: Bool, completion: ((Bool) -> Void)?) {
+        writeInFlight = false
+        if let completion {
+            dispatchQueue.async { completion(ok) }
+        }
+        pumpWrites()
+    }
+
+    /// Roughly ten seconds of a child that never reads, after which the bytes
+    /// are reported lost rather than held forever.
+    private static let maxStalledWriteAttempts = 200
+    private static let stalledWriteRetryDelay: TimeInterval = 0.05
     
     /* Used to generate the next file name counter */
     var logFileCounter = 0

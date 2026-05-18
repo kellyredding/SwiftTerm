@@ -8,7 +8,278 @@ verification the release passed.
 
 This file is part of commit 4 (the Galactic customization commit) in
 the four-commit `main` structure described in `MAINTAINING.md`. It
-grows by one entry per upstream bump.
+gains an entry per tagged release — both upstream bumps and re-cuts
+against the same upstream, since either can change the patch state.
+
+## v1.13.0-galactic.12 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream to add the
+PTY write patch below.
+
+### Patches added in this revision
+
+- **`LocalProcess.send` writes in order, in full, and says when it is done**
+  (`LocalProcess`) — three defects in one function, each of which a consumer
+  felt as a prompt that arrived wrong rather than as an error.
+
+  A short write dropped its remainder. `DispatchIO.write` hands its handler
+  the bytes it could *not* write, and the handler ignored that parameter, so
+  anything the kernel declined was lost. A pty in raw mode was MEASURED to
+  accept about 1022 bytes when the child is not draining — well inside the
+  size of a composed prompt — so a prompt written to a busy child lost its
+  tail. `total` was then advanced by the whole count regardless of how much
+  was written, so the one number that could have exposed this was wrong in
+  exactly the case that mattered. And every call issued an independent
+  one-shot write on a *concurrent* global queue, so two sends had no order
+  relative to each other and two prompts written close together interleaved
+  their bytes.
+
+  `DispatchIO.write` turned out to be the wrong primitive rather than merely
+  misused, which is why this is a rewrite and not a guard: handed more than a
+  pty's input queue can take, it never called its handler at all — not with a
+  remainder, not with an error — while the tty rang the bell once per rejected
+  byte. So it can neither be asked how much it wrote nor relied on to report
+  that it finished.
+
+  Writes are now serialized on a queue of the process's own, in chunks of 256
+  bytes so no single write can reach the overflow path, each carried to
+  completion before the next begins. A new `send(data:completion:)` overload
+  reports when the bytes are genuinely gone; the existing `send(data:)` is
+  unchanged for its callers and simply passes nil. The completion is posted to
+  the same `dispatchQueue` delegate callbacks use rather than called on the
+  write queue — a consumer's closure written where its UI lives is main-actor
+  isolated, and calling it on the write queue trips the isolation assertion
+  and takes the process down. Found exactly that way, by a harness, before it
+  reached an application.
+
+  Why the consumer needs the completion: no fixed delay can stand in for it.
+  How long a payload takes to land is a fact about what the child is doing,
+  not about the text, so a caller that writes a prompt and then presses Return
+  on a timer will submit whatever fraction happened to arrive.
+
+### Verification
+
+- `GITHUB_ACTIONS=true swift build` on the fork passes.
+- `GITHUB_ACTIONS=true swift test`: 376 tests, 33 suites, 2 pre-existing
+  issues — both in `ColorTests.testTerminalAnsi256PaletteStrategyRuntimeToggle`,
+  which asserts upstream's `.base16Lab` default against the deliberate
+  `.xterm` override carried since `galactic.4`. Identical test count and
+  identical failures to `.9`, `.10` and `.11`, so neither is a regression from
+  this patch.
+- Standalone PTY harness against the real `LocalProcess`, two back-to-back
+  payloads (4096 and 2048 bytes) written to a child that starts reading late:
+  all 6144 bytes arrived, split exactly 4096/2048, both completions reported
+  success, and the first payload lay entirely before the second in the
+  stream. The same harness against the pre-patch code accepted ~1022 bytes
+  and silently dropped the rest.
+- Galactic smoke test against this revision: `swift build` and `swift test`
+  green against the `bump/1.13.0-galactic.12` branch before promotion — 1511
+  tests, 5 skipped, 0 failures. Run against the branch rather than the working
+  tree deliberately: it is what proves the committed content is what Galactic
+  compiles against, and it would catch a file left unstaged.
+
+## v1.13.0-galactic.11 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream to add
+the Return kitty-encoding patch below.
+
+### Patches added in this revision
+
+- **`kittyFunctionalKey` recognises Return** (`MacTerminalView`) — a
+  `kVK_Return` case returning `.enter`, so `keyDown` takes the kitty
+  branch for Return instead of detouring through `interpretKeyEvents`.
+  That detour resolves to `doCommand(by:)` → `insertNewline`, which
+  carries no modifier information at all, so every modified Return —
+  Shift, Option, Control, Command — arrived at the embedded application
+  as a bare carriage return, indistinguishable from Return itself. A host
+  wanting to bind a modified Return to its own action could not: the bytes
+  it would have to match never left the view. Unmodified Return is
+  unaffected, because the encoder still emits a bare CR for `.enter`
+  unless the active kitty flags call for the CSI-u form — so a terminal
+  whose child has not negotiated the protocol behaves exactly as before,
+  and the case is inert until one does.
+
+### Verification
+
+- `GITHUB_ACTIONS=true swift build` on the fork passes.
+- `GITHUB_ACTIONS=true swift test`: 376 tests, 33 suites, 2 pre-existing
+  issues — both in
+  `ColorTests.testTerminalAnsi256PaletteStrategyRuntimeToggle`, which
+  asserts upstream's `.base16Lab` default against the deliberate `.xterm`
+  override carried since `galactic.4`. Identical test count and identical
+  failures to `.9` and `.10`, so neither is a regression from this patch.
+- Galactic smoke test against this revision: `swift build` and
+  `swift test` green, 8 tests, 0 failures.
+
+## v1.13.0-galactic.10 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream with
+**no code change** — the Swift source tree is byte-identical to
+`v1.13.0-galactic.9`. This revision exists solely to correct
+`MAINTAINING.md`, which had drifted from the repository it describes in
+ways that would have destroyed work on the next upstream bump.
+
+### Documentation corrected
+
+- **The lineage is four commits, not three.** `GalacticApiSmoke/` was
+  added as commit 2 and never written into the invariants. `PATCHES.md`
+  has asserted the four-commit structure since it was written, so the
+  two documents contradicted each other, and the one describing the
+  bump procedure was the wrong one.
+- **Step 4a branched from the wrong commit.** It resolved the base with
+  `git rev-list --max-parents=0`, which returns the orphan root. Every
+  bump that followed it literally would have rebuilt the lineage without
+  `GalacticApiSmoke/` — 261 lines of compile-only API contract silently
+  absent from the release, and nothing in the procedure would have
+  noticed. It now branches from commit 2.
+- **Step 4b preserved one named file.** It snapshotted `MAINTAINING.md`
+  across the tree-replace and restored only that, so `PATCHES.md` — also
+  owned by the base — was wiped. Step 4c would then have applied the
+  previous release's patch, which carries a `PATCHES.md` delta, against
+  a file that no longer existed. The step now restores the base's whole
+  tree, because naming files is what caused both losses and would cause
+  the next one.
+- **The orphan root holds two files, not one**, and the patch-history
+  section attributed `PATCHES.md` to commit 3 rather than commit 4.
+- **Step 5 quietly rewrote a tracked file.** Verifying with
+  `GITHUB_ACTIONS=true` drops the benchmark dependencies from the
+  resolved graph, and SwiftPM rewrites `Package.resolved` to match —
+  65 pins removed. Found by running the step while cutting this
+  revision and diffing before committing. The step now says so and says
+  to restore the file.
+
+### Why a revision bump for a documentation change
+
+`v1.13.0-galactic.9` was already published and consumed. Re-pointing it
+would have broken SwiftPM's `(URL, version) → revision` mapping in every
+consumer, which the safety rules forbid; the same rules prescribe a
+revision bump for exactly this case — a post-tag correction to commit 4.
+`.9` is not superseded in any functional sense and remains valid: the
+engine it ships is identical to this one.
+
+### Verification
+
+- `swift build` on the fork passes.
+- `swift test` passes with the same results as `.9`.
+- Galactic's smoke test was not re-run, and the reason is stronger than
+  running it would have been: `git diff v1.13.0-galactic.9 -- Sources
+  Tests Package.swift` is empty, so the surface Galactic compiles
+  against is provably unchanged from the revision it already builds on.
+
+## v1.13.0-galactic.9 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream (no
+version bump) to add the caret blink-restore patch below.
+
+### Patches added in this revision
+
+- **Caret blink survives a cursor hide/show cycle** (`MacTerminalView`,
+  `AppleTerminalView`) — both paths that put the caret view back into the
+  hierarchy now call `caretView.updateCursorStyle()` after `addSubview`.
+  A blinking caret exists only as a repeating `CABasicAnimation` on the
+  caret layer's opacity; it is not stored state anywhere. `hideCursor`
+  removes the caret from the view hierarchy, which takes its layer out of
+  the render tree, and Core Animation cancels the animation when that
+  happens (`animationDidStop` reports `finished: false`). The `style`
+  property the animation is derived from is untouched, so the property
+  observer that rebuilds it never fires, and the caret returns rendering
+  the correct shape but permanently steady. Full-screen programs emit
+  DECTCEM hide/show around their redraws — Claude Code does so during
+  session startup — so in practice a blinking caret never survived past
+  the first redraw. The only thing that restored it was an incidental
+  `updateCursorStyle()` from focus gain or the became-main observer,
+  which made the bug look like a focus problem. Restoring on the
+  re-attach branches only, rather than on every refresh, matters: an
+  unconditional re-assert would restart the animation continuously and
+  hold the caret at full opacity, which reads as a caret that never
+  blinks at all.
+
+### Verification
+
+- `GITHUB_ACTIONS=true swift build` on the fork passes.
+- `GITHUB_ACTIONS=true swift test`: 376 tests, 33 suites, 2 pre-existing
+  issues — both in `ColorTests.testTerminalAnsi256PaletteStrategyRuntimeToggle`,
+  which asserts upstream's `.base16Lab` default against the deliberate
+  `.xterm` override carried since `galactic.4`. Confirmed identical on
+  `v1.13.0-galactic.8` with this revision's patch stashed, so not a
+  regression from it.
+- Galactic smoke test on `v1.13.0-galactic.9`: (filled in after promote).
+
+## v1.13.0-galactic.8 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream (no
+version bump) to add the auto-follow intent and selection-freeze
+correctness patches below.
+
+### Patches added in this revision
+
+- **Gesture-sourced follow intent (`Terminal.scrolledUpByUser`)** — a new
+  flag distinct from `userScrolling`. `userScrolling` is written by both
+  scroll gestures and selection, so a transient selection could strand it
+  true while the viewport sat at the live bottom, silently disabling
+  auto-follow. `scrolledUpByUser` is written ONLY by `scrollTo` — the funnel
+  every wheel / knob / page scroll passes through — from the resulting
+  position; selection and output never touch it. This gives recovery a
+  single-writer intent signal to distinguish a genuine scroll-up from a
+  stranded freeze.
+- **`scrollTo` reconciles `scrolledUpByUser` ungated by selection**
+  (`AppleTerminalView`) — reconciled on every scroll movement regardless of
+  selection state, so scrolling back to the bottom during an active
+  selection still clears follow intent. The adjacent `userScrolling`
+  reconciliation is skipped during selection, which is what left the gate
+  stranded.
+- **`feedPrepare` recovery keys off `scrolledUpByUser`**
+  (`AppleTerminalView`) — clears a stranded `userScrolling` whenever the
+  user has not gesture-scrolled up, regardless of current scroll position.
+  The prior guard required `yDisp >= yBase`, so once drift opened up it
+  could never recover. Still gated on `!selection.active`, preserving the
+  selection-freeze invariant.
+- **`selectionChanged` freezes the viewport only on a non-empty selection**
+  (`MacTerminalView`) — gates on `selection.active && selection.hasSelectionRange`.
+  An empty soft-start selection (`start == end`, produced by a click with a
+  hair of mouse movement) no longer freezes the viewport and disables
+  auto-follow.
+- **`mouseUp` clears an empty selection** (`MacTerminalView`) — a drag that
+  ends with no range (`!hasSelectionRange`) clears `selection.active` on
+  release. `mouseUp` otherwise never cleared it, so a stray micro-drag left
+  `selection.active` stranded true and froze auto-follow until a later
+  click.
+
+### Verification
+
+- `GITHUB_ACTIONS=true swift build` on the fork passes.
+- Galactic smoke test on `v1.13.0-galactic.8`: Galactic `swift build` +
+  `swift test` green against this tag.
+
+## v1.13.0-galactic.7 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream (no
+version bump) to add the caret patches below.
+
+Note: `.5` and `.6` were prior re-cuts against this same upstream and did
+not receive PATCHES entries — `.6` added the `scrollTo` reorder (sets
+`userScrolling` before invalidating the view, closing the
+following-but-drifted transient). `.7` carries everything `.6` had plus
+the caret patches below.
+
+### Patches added in this revision
+
+- **Caret reposition on focus gain** — `becomeFirstResponder` and the
+  `NSWindowDidBecomeMainNotification` handler now call
+  `updateCursorPosition()` after restyling. Focus-gain alone restyled the
+  caret (shape/blink) but never repositioned it, so a cursor that moved
+  while the window was unfocused painted at a stale cell until the next
+  output. Repositioning on focus eliminates that drift.
+- **`repositionCaret()` public method** — public wrapper over the internal
+  `updateCursorPosition()` on `AppleTerminalView`, so a Galactic subclass
+  can force a caret reposition after it mutates the viewport (e.g. snapping
+  to the live bottom on focus), where the internal display cycle would
+  otherwise leave the caret frame stale until the next output.
+
+### Verification
+
+- `swift build` on the fork passes.
+- Galactic smoke test on `v1.13.0-galactic.7`: (filled in Phase 2).
 
 ## v1.13.0-galactic.4 — upstream v1.13.0
 
