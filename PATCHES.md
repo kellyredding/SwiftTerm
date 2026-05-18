@@ -10,6 +10,82 @@ This file is part of commit 4 (the Galactic customization commit) in
 the four-commit `main` structure described in `MAINTAINING.md`. It
 grows by one entry per upstream bump.
 
+## v1.13.0-galactic.8 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream (no
+version bump) to add the auto-follow intent and selection-freeze
+correctness patches below.
+
+### Patches added in this revision
+
+- **Gesture-sourced follow intent (`Terminal.scrolledUpByUser`)** — a new
+  flag distinct from `userScrolling`. `userScrolling` is written by both
+  scroll gestures and selection, so a transient selection could strand it
+  true while the viewport sat at the live bottom, silently disabling
+  auto-follow. `scrolledUpByUser` is written ONLY by `scrollTo` — the funnel
+  every wheel / knob / page scroll passes through — from the resulting
+  position; selection and output never touch it. This gives recovery a
+  single-writer intent signal to distinguish a genuine scroll-up from a
+  stranded freeze.
+- **`scrollTo` reconciles `scrolledUpByUser` ungated by selection**
+  (`AppleTerminalView`) — reconciled on every scroll movement regardless of
+  selection state, so scrolling back to the bottom during an active
+  selection still clears follow intent. The adjacent `userScrolling`
+  reconciliation is skipped during selection, which is what left the gate
+  stranded.
+- **`feedPrepare` recovery keys off `scrolledUpByUser`**
+  (`AppleTerminalView`) — clears a stranded `userScrolling` whenever the
+  user has not gesture-scrolled up, regardless of current scroll position.
+  The prior guard required `yDisp >= yBase`, so once drift opened up it
+  could never recover. Still gated on `!selection.active`, preserving the
+  selection-freeze invariant.
+- **`selectionChanged` freezes the viewport only on a non-empty selection**
+  (`MacTerminalView`) — gates on `selection.active && selection.hasSelectionRange`.
+  An empty soft-start selection (`start == end`, produced by a click with a
+  hair of mouse movement) no longer freezes the viewport and disables
+  auto-follow.
+- **`mouseUp` clears an empty selection** (`MacTerminalView`) — a drag that
+  ends with no range (`!hasSelectionRange`) clears `selection.active` on
+  release. `mouseUp` otherwise never cleared it, so a stray micro-drag left
+  `selection.active` stranded true and froze auto-follow until a later
+  click.
+
+### Verification
+
+- `GITHUB_ACTIONS=true swift build` on the fork passes.
+- Galactic smoke test on `v1.13.0-galactic.8`: Galactic `swift build` +
+  `swift test` green against this tag.
+
+## v1.13.0-galactic.7 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream (no
+version bump) to add the caret patches below.
+
+Note: `.5` and `.6` were prior re-cuts against this same upstream and did
+not receive PATCHES entries — `.6` added the `scrollTo` reorder (sets
+`userScrolling` before invalidating the view, closing the
+following-but-drifted transient). `.7` carries everything `.6` had plus
+the caret patches below.
+
+### Patches added in this revision
+
+- **Caret reposition on focus gain** — `becomeFirstResponder` and the
+  `NSWindowDidBecomeMainNotification` handler now call
+  `updateCursorPosition()` after restyling. Focus-gain alone restyled the
+  caret (shape/blink) but never repositioned it, so a cursor that moved
+  while the window was unfocused painted at a stale cell until the next
+  output. Repositioning on focus eliminates that drift.
+- **`repositionCaret()` public method** — public wrapper over the internal
+  `updateCursorPosition()` on `AppleTerminalView`, so a Galactic subclass
+  can force a caret reposition after it mutates the viewport (e.g. snapping
+  to the live bottom on focus), where the internal display cycle would
+  otherwise leave the caret frame stale until the next output.
+
+### Verification
+
+- `swift build` on the fork passes.
+- Galactic smoke test on `v1.13.0-galactic.7`: (filled in Phase 2).
+
 ## v1.13.0-galactic.4 — upstream v1.13.0
 
 Base: upstream `migueldeicaza/SwiftTerm` at tag `v1.13.0`.
