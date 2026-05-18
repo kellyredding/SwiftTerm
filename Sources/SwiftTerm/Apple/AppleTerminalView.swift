@@ -19,6 +19,13 @@ import SwiftUI
 
 let SwiftTermUnderlineStyleKey = NSAttributedString.Key("SwiftTermUnderlineStyle")
 
+// GALACTIC: Custom attribute key to carry bold state through to glyph rendering.
+// Needed because fonts without a bold variant (e.g. Monaco) make the bold font
+// identical to normal, so comparing runFont == fontSet.bold is unreliable.
+extension NSAttributedString.Key {
+    static let galacticBold = NSAttributedString.Key("galacticBold")
+}
+
 #if os(iOS) || os(visionOS)
 import UIKit
 typealias TTColor = UIColor
@@ -84,7 +91,8 @@ struct ViewLineInfo {
 }
 
 extension TerminalView {
-    typealias CellDimension = CGSize
+    // GALACTIC: public so ScrollbackTerminalView can access cellDimension
+    public typealias CellDimension = CGSize
     
     func resetCaches ()
     {
@@ -174,17 +182,44 @@ extension TerminalView {
     func processSizeChange (newSize: CGSize) -> Bool {
         let newRows = Int (newSize.height / cellDimension.height)
         let newCols = Int (getEffectiveWidth (size: newSize) / cellDimension.width)
-        
+
         if newCols != terminal.cols || newRows != terminal.rows {
+            // GALACTIC: Capture pre-reflow "riding the live tail" intent so we
+            // can re-pin yDisp = yBase if reflow nudges the viewport short
+            // of the buffer bottom. Column changes recompute every wrapped
+            // line; even with userScrolling=false, yDisp can land one or
+            // more rows below yBase after the recompute, which leaves
+            // streaming output with no auto-follow until the user scrolls.
+            // Only restore when the user was clearly following live output
+            // (no scrollback offset, no active selection, no userScrolling
+            // gate). Anything else — they wanted to be where they were.
+            let wasAtBottomLiveFollow =
+                !terminal.userScrolling
+                && !selection.active
+                && terminal.displayBuffer.yDisp
+                    >= terminal.displayBuffer.yBase
+
             selection.active = false
             terminal.resize (cols: newCols, rows: newRows)
-            
+
+            // GALACTIC: Re-pin to the bottom if reflow drifted yDisp behind
+            // yBase. yDisp >= yBase (already at or beyond the bottom) is a
+            // no-op; yDisp < yBase combined with the captured intent means
+            // reflow lost our anchor.
+            if wasAtBottomLiveFollow {
+                let buf = terminal.displayBuffer
+                if buf.yDisp < buf.yBase {
+                    buf.yDisp = buf.yBase
+                    terminal.userScrolling = false
+                }
+            }
+
             // These used to be outside
             accessibility.invalidate ()
             search.invalidate ()
-            
+
             terminalDelegate?.sizeChanged (source: self, newCols: newCols, newRows: newRows)
-           
+
             updateScroller()
             return true
         }
@@ -216,11 +251,14 @@ extension TerminalView {
         let fontAttributes = [NSAttributedString.Key.font: fontSet.normal]
         let cellWidth = "W".size(withAttributes: fontAttributes).width
         #endif
-        // Snap to pixel grid to avoid sub-pixel seams between adjacent cells
-        let scale = backingScaleFactor()
-        let snappedWidth = ceil(cellWidth * scale) / scale
-        let snappedHeight = ceil(cellHeight * scale) / scale
-        return CellDimension(width: max(1, snappedWidth), height: max(min(snappedHeight, 8192), 1))
+        // GALACTIC: Skip upstream's pixel-grid snap on cell dimensions
+        // (introduced by the GPU backend refactor in v1.13.0). The snap
+        // rounds cell width up to the nearest device pixel, making cells
+        // wider than the font's natural advance width and producing a
+        // visibly wider character spacing than Ghostty / WebKit / other
+        // monospace renderers. Use the raw fractional cell metrics for
+        // visual parity with the scrollback overlay's HTML rendering.
+        return CellDimension(width: max(1, cellWidth), height: max(min(cellHeight, 8192), 1))
     }
     
     func mapColor (color: Attribute.Color, isFg: Bool, isBold: Bool, useBrightColors: Bool = true) -> TTColor
@@ -228,6 +266,11 @@ extension TerminalView {
         switch color {
         case .defaultColor:
             if isFg {
+                // GALACTIC: Use theme-provided bold foreground color (ANSI bright
+                // white from the active theme) instead of algorithmic brightening.
+                if isBold && useBrightColors, let boldFg = galacticBoldForegroundColor {
+                    return boldFg
+                }
                 return nativeForegroundColor
             } else {
                 return nativeBackgroundColor
@@ -389,7 +432,8 @@ extension TerminalView {
         var nsattr: [NSAttributedString.Key:Any] = [
             .font: tf,
             .foregroundColor: fg,
-            .backgroundColor: bg
+            .backgroundColor: bg,
+            .galacticBold: isBold,  // GALACTIC: carry bold state for FillStroke rendering
         ]
         if flags.contains (.underline) {
             let underlineColor = attribute.underlineColor.map {
@@ -460,7 +504,8 @@ extension TerminalView {
         var nsattr: [NSAttributedString.Key:Any] = [
             .font: tf,
             .foregroundColor: fgColor,
-            .backgroundColor: bgColor
+            .backgroundColor: bgColor,
+            .galacticBold: isBold,  // GALACTIC: carry bold state for FillStroke rendering
         ]
         if flags.contains (.underline) {
             let underlineColor = attribute.underlineColor.map {
@@ -1361,8 +1406,14 @@ extension TerminalView {
             context.setShouldAntialias(true)
             context.setAllowsAntialiasing(true)
             #if os(macOS)
-            context.setShouldSmoothFonts(true)
-            context.setAllowsFontSmoothing(true)
+            context.setShouldSmoothFonts(false)
+            context.setAllowsFontSmoothing(false)
+            // GALACTIC: Enable FillStroke text rendering for heavier font weight.
+            // Uses the kitty terminal approach: stroke glyph outlines while filling
+            // to thicken text, compensating for layer-backed view thinning.
+            // Set to 0.0 to disable. Typical range: 0.2-0.75.
+            let galacticFontThickenAmount: CGFloat = 0.0
+            let galacticBoldExtraThicken: CGFloat = 0.7
             #endif
 
             // Glyph drawing loop — reuses cached CTLines
@@ -1395,6 +1446,10 @@ extension TerminalView {
                     }
 
                     nativeForegroundColor.set()
+                    // GALACTIC: Also set stroke color for default foreground
+                    #if os(macOS)
+                    nativeForegroundColor.setStroke()
+                    #endif
 
                     if runAttributes.keys.contains(.foregroundColor) {
                         let color = runAttributes[.foregroundColor] as! TTColor
@@ -1403,7 +1458,31 @@ extension TerminalView {
                             context.setFillColorSpace(colorSpace)
                         }
                         context.setFillColor(cgColor)
+                        // GALACTIC: Match stroke color to fill for FillStroke thickening
+                        #if os(macOS)
+                        context.setStrokeColor(cgColor)
+                        #endif
                     }
+
+                    // GALACTIC: Apply FillStroke thickening (heavier for bold runs).
+                    // Uses .galacticBold attribute instead of font identity because fonts
+                    // without a bold variant (e.g. Monaco) make fontSet.bold == fontSet.normal.
+                    // Per-run: bold gets `base + bold-extra` thickness, non-bold gets
+                    // `base`; when thickness > 0 we engage .fillStroke mode, otherwise
+                    // we fall back to plain .fill so that a prior bold run's mode does
+                    // not leak into the next non-bold run.
+                    #if os(macOS)
+                    let isBoldRun = (runAttributes[.galacticBold] as? Bool) == true
+                    let thickness = isBoldRun
+                        ? galacticFontThickenAmount + galacticBoldExtraThicken
+                        : galacticFontThickenAmount
+                    if thickness > 0 {
+                        context.setLineWidth(thickness)
+                        context.setTextDrawingMode(.fillStroke)
+                    } else {
+                        context.setTextDrawingMode(.fill)
+                    }
+                    #endif
 
                     CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
 
@@ -1582,17 +1661,59 @@ extension TerminalView {
         }
 
         terminal.clearUpdateRange ()
-                
+
         #if os(macOS)
+        // GALACTIC: getUpdateRange() returns dirty rows in TERMINAL-row
+        // coordinates anchored to yBase + cursor.y. The view renders
+        // with bufferOffset = yDisp; when the user is scrolled up
+        // (yDisp < yBase), terminal row N corresponds to viewport row
+        // N + (yBase - yDisp). Without compensating for this offset,
+        // every in-place cell write — animated spinners, status-bar
+        // updates, anything that doesn't trigger a full scroll —
+        // invalidates the wrong screen rows. AppKit redraws stale
+        // cells (drawTerminalContents reads buffer at yDisp + screenRow,
+        // which hasn't changed for those rows) while the actually-
+        // changed cell at viewport row N + (yBase - yDisp) stays
+        // unpainted until something forces a full-bounds invalidation
+        // (a click, a session switch, a `\n` that calls
+        // `terminal.refresh(0, rows-1)` and dirties the whole screen).
+        // Compensating for the offset corrects the screen-row
+        // calculation so partial-region invalidation works while
+        // scrolled up.
+        let buffer = terminal.displayBuffer
+        let viewportOffset = buffer.yBase - buffer.yDisp
+        let viewportRowStart = max(0, rowStart + viewportOffset)
+        let viewportRowEnd = min(
+            terminal.rows - 1, rowEnd + viewportOffset
+        )
+        // If the entire dirty range has drifted below the viewport
+        // (cursor row + offset > rows-1), there's nothing to paint
+        // here. Drop through to the function's normal completion
+        // path so pendingDisplay still resets and the next feed
+        // schedules fresh.
+        guard viewportRowEnd >= viewportRowStart else {
+            pendingDisplay = false
+            updateDebugDisplay()
+            if (notifyAccessibility) {
+                accessibility.invalidate()
+                NSAccessibility.post(element: self, notification: .valueChanged)
+                NSAccessibility.post(element: self, notification: .selectedTextChanged)
+            }
+            return
+        }
+
         let baseLine = frame.height
         var region = CGRect (x: 0,
-                             y: baseLine - (cellDimension.height + CGFloat(rowEnd) * cellDimension.height),
+                             y: baseLine - (cellDimension.height + CGFloat(viewportRowEnd) * cellDimension.height),
                              width: frame.width,
-                             height: CGFloat(rowEnd-rowStart + 1) * cellDimension.height)
-        
-        // If we are the last line, we should also queue a refresh for the "remaining" bits at the
-        // end which can be redrawn by large unicode
-        if rowEnd == terminal.rows - 1 {
+                             height: CGFloat(viewportRowEnd-viewportRowStart + 1) * cellDimension.height)
+
+        // If we are the last viewport line, we should also queue a refresh
+        // for the "remaining" bits at the end which can be redrawn by
+        // large unicode. Check viewport row (not terminal row) so the
+        // "remaining bits" extension only fires when the dirty range
+        // genuinely reaches the bottom of the visible viewport.
+        if viewportRowEnd == terminal.rows - 1 {
             let oh = region.height
             let oy = region.origin.y
             region = CGRect (x: 0, y: 0, width: frame.width, height: oh + oy)
@@ -1823,13 +1944,12 @@ extension TerminalView {
     
     public func scroll (toPosition: Double)
     {
-        userScrolling = true
         let displayBuffer = terminal.displayBuffer
         let oldPosition = displayBuffer.yDisp
-        
+
         let maxScrollback = displayBuffer.lines.count - displayBuffer.rows
         var newScrollPosition = Int (Double (maxScrollback) * toPosition)
-        
+
         if newScrollPosition < 0 {
             newScrollPosition = 0
         }
@@ -1840,27 +1960,59 @@ extension TerminalView {
         if newScrollPosition != oldPosition {
             scrollTo(row: newScrollPosition)
         }
-        userScrolling = false
     }
-    
+
+    /// Scrolls the viewport so that `row` becomes the top displayed line.
+    /// Updates `userScrolling` based on whether the resulting position is
+    /// at the bottom of the buffer.
     public func scrollTo (row: Int, notifyAccessibility: Bool = true)
     {
         let displayBuffer = terminal.displayBuffer
+
+        // GALACTIC: Update the terminal's userScrolling flag based on whether
+        // the viewport is at the bottom. When the user scrolls up, this
+        // prevents Terminal.scroll() from snapping yDisp back to yBase
+        // on each new line of output. Cleared when the user scrolls
+        // back to the bottom, resuming auto-follow behavior.
+        //
+        // This MUST be updated BEFORE the setNeedsDisplay(frame) below.
+        // scrollTo moves yDisp first and then invalidates the view; an
+        // always-on follow re-pin observing that refresh has to see a
+        // (yDisp, userScrolling) pair that already agrees, or it reads a
+        // deliberate scroll as drift and snaps the viewport back to the
+        // bottom — defeating the scroll. Wheel, knob, and page all route
+        // through scrollTo, so ordering it here fixes every scroll path at
+        // once. (Previously this ran after the refresh, leaving a transient
+        // window where the view was repainted with userScrolling stale.)
+        //
+        // Don't update userScrolling while a selection is active.
+        // selectionChanged owns userScrolling during selection — it
+        // freezes the viewport on selection start and evaluates scroll
+        // position on selection clear. Without this guard, scrollTo
+        // (called by auto-scroll during drag, or trackpad scrolling
+        // during selection) would override the freeze.
         if row != displayBuffer.yDisp {
             terminal.setViewYDisp (row)
-            
+
+            if !selection.active {
+                terminal.userScrolling = displayBuffer.yDisp < displayBuffer.yBase
+            }
+
             // tell the terminal we want to refresh all the rows
             terminal.refresh (startRow: 0, endRow: terminal.rows)
-            
+
             // do the display update
             updateDisplay (notifyAccessibility: notifyAccessibility)
             //selectionView.notifyScrolled(source: terminal)
             terminalDelegate?.scrolled (source: self, position: scrollPosition)
             updateScroller()
             setNeedsDisplay(frame)
+        } else if !selection.active {
+            // No viewport movement, but keep the flag reconciled with position.
+            terminal.userScrolling = displayBuffer.yDisp < displayBuffer.yBase
         }
     }
-    
+
     /// Scrolls the content of the terminal one page up
     public func pageUp()
     {
@@ -1899,16 +2051,49 @@ extension TerminalView {
     func feedPrepare()
     {
         search.invalidate()
-        // Preserve manual selection while output is streaming when mouse reporting is disabled.
-        if allowMouseReporting {
+        // GALACTIC: Recover from stuck userScrolling before the feed
+        // runs. A transient selection (click-drag that clears before
+        // the next data chunk) can leave userScrolling true while the
+        // viewport is still at the bottom. Clearing it here ensures
+        // Terminal.scroll() keeps yDisp tracking yBase during this
+        // feed. Only fires when at bottom with no active selection —
+        // genuine scroll-up (yDisp < yBase) is not affected.
+        if !selection.active && terminal.userScrolling {
+            let buf = terminal.displayBuffer
+            if buf.yDisp >= buf.yBase {
+                terminal.userScrolling = false
+            }
+        }
+        // GALACTIC: Only clear selection when following live output.
+        // When the user has scrolled up or has an active selection,
+        // incoming data goes to yBase+y (beyond the frozen viewport)
+        // and doesn't affect the visible content under the selection.
+        // This supersedes upstream's allowMouseReporting-gated clear
+        // (PR #471) — Galactic's invariant 2 (selection freezes the
+        // viewport) is stricter than mouse-reporting state.
+        if !terminal.userScrolling {
             selection.active = false
         }
+        preFeedLinesTop = terminal.buffer.linesTop
         startDisplayUpdates()
     }
-    
+
     func feedFinish ()
     {
         suspendDisplayUpdates ()
+
+        // GALACTIC: Adjust selection rows for any lines trimmed during
+        // feed. When the circular buffer is full, each scroll() call
+        // recycles the oldest line, shifting all indices by -1.
+        // linesTop increments on each trim, so the delta tells us
+        // how many lines were removed.
+        if selection.active {
+            let trimmed = terminal.buffer.linesTop - preFeedLinesTop
+            if trimmed > 0 {
+                selection.adjustForTrimmedLines(trimmed)
+            }
+        }
+
         queuePendingDisplay()
     }
     
@@ -1929,16 +2114,6 @@ extension TerminalView {
     }
          
     /**
-     * Triggers a resize of the underlying terminal to the desired columsn and rows
-     */
-    public func resize (cols: Int, rows: Int)
-    {
-        terminal.resize (cols: cols, rows: rows)
-        sizeChanged (source: terminal)
-        terminal.softReset()
-    }
-
-    /**
      * Changes the scrollback size at runtime.
      *
      * - Parameter newScrollback: The new scrollback size in lines. Pass `nil` to disable scrollback.
@@ -1950,24 +2125,12 @@ extension TerminalView {
         terminalDelegate?.scrolled(source: self, position: scrollPosition)
         queuePendingDisplay()
     }
-    
-    /**
-     * Sends the specified slice of byte arrays to the program running under the terminal emulator
-     * - Parameter data: the slice of an array to send to the client
-     */
-    public func send(data: ArraySlice<UInt8>)
-    {
-        ensureCaretIsVisible ()
-        #if os(iOS) || os(visionOS)
-        if TerminalView.textInputDebugEnabled {
-            let previewBytes = data.prefix(32).map { String(format: "%02X", $0) }.joined(separator: " ")
-            print("UITextInput[\(TerminalView.textInputLogCounter + 1)]: send bytes=\(data.count) [\(previewBytes)]")
-            TerminalView.textInputLogCounter += 1
-        }
-        #endif
-        terminalDelegate?.send (source: self, data: data)
-    }
-    
+
+    // GALACTIC: resize(cols:rows:) and send(data:) relocated to
+    // MacTerminalView.swift class body (marked open) so subclasses
+    // in other modules can override them.
+
+
     /**
      * Sends the specified string encoded at utf8 to the program running under the terminal emulator
      * - Parameter txt: the string to send to the client
