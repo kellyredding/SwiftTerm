@@ -15,7 +15,7 @@ import CoreGraphics
 import CoreText
 
 // The CaretView is used to show the cursor
-class CaretView: NSView, CALayerDelegate {
+public class CaretView: NSView, CALayerDelegate {
     weak var terminal: TerminalView?
     var ctline: CTLine?
     var bgColor: CGColor
@@ -36,8 +36,12 @@ class CaretView: NSView, CALayerDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
+    // GALACTIC: `public` needed because `CaretView` is public (Galactic
+    // patch) and overrides of open methods in public classes must be
+    // at least public. Upstream's override defaults to internal which
+    // compiles only when CaretView is internal.
     // Enable transparency support for the cursor (matches iOS behavior)
-    override func makeBackingLayer() -> CALayer {
+    public override func makeBackingLayer() -> CALayer {
         let layer = super.makeBackingLayer()
         layer.isOpaque = false
         layer.backgroundColor = NSColor.clear.cgColor
@@ -116,14 +120,14 @@ class CaretView: NSView, CALayerDelegate {
         setNeedsDisplay(bounds)
     }
     
-    func draw(_ layer: CALayer, in context: CGContext) {
+    public func draw(_ layer: CALayer, in context: CGContext) {
         drawCursor (in: context, hasFocus: tracksFocus ? (terminal?.hasFocus ?? true) : true)
     }
-    
-    override func draw(_ dirtyRect: NSRect) {
+
+    public override func draw(_ dirtyRect: NSRect) {
     }
-    
-    override func hitTest(_ point: NSPoint) -> NSView? {
+
+    public override func hitTest(_ point: NSPoint) -> NSView? {
         // we do not want to steal hits, let the terminal view take them
         return nil
     }

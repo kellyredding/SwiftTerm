@@ -8,7 +8,123 @@ verification the release passed.
 
 This file is part of commit 4 (the Galactic customization commit) in
 the four-commit `main` structure described in `MAINTAINING.md`. It
-grows by one entry per upstream bump.
+gains an entry per tagged release — both upstream bumps and re-cuts
+against the same upstream, since either can change the patch state.
+
+## v1.13.0-galactic.9 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream (no
+version bump) to add the caret blink-restore patch below.
+
+### Patches added in this revision
+
+- **Caret blink survives a cursor hide/show cycle** (`MacTerminalView`,
+  `AppleTerminalView`) — both paths that put the caret view back into the
+  hierarchy now call `caretView.updateCursorStyle()` after `addSubview`.
+  A blinking caret exists only as a repeating `CABasicAnimation` on the
+  caret layer's opacity; it is not stored state anywhere. `hideCursor`
+  removes the caret from the view hierarchy, which takes its layer out of
+  the render tree, and Core Animation cancels the animation when that
+  happens (`animationDidStop` reports `finished: false`). The `style`
+  property the animation is derived from is untouched, so the property
+  observer that rebuilds it never fires, and the caret returns rendering
+  the correct shape but permanently steady. Full-screen programs emit
+  DECTCEM hide/show around their redraws — Claude Code does so during
+  session startup — so in practice a blinking caret never survived past
+  the first redraw. The only thing that restored it was an incidental
+  `updateCursorStyle()` from focus gain or the became-main observer,
+  which made the bug look like a focus problem. Restoring on the
+  re-attach branches only, rather than on every refresh, matters: an
+  unconditional re-assert would restart the animation continuously and
+  hold the caret at full opacity, which reads as a caret that never
+  blinks at all.
+
+### Verification
+
+- `GITHUB_ACTIONS=true swift build` on the fork passes.
+- `GITHUB_ACTIONS=true swift test`: 376 tests, 33 suites, 2 pre-existing
+  issues — both in `ColorTests.testTerminalAnsi256PaletteStrategyRuntimeToggle`,
+  which asserts upstream's `.base16Lab` default against the deliberate
+  `.xterm` override carried since `galactic.4`. Confirmed identical on
+  `v1.13.0-galactic.8` with this revision's patch stashed, so not a
+  regression from it.
+- Galactic smoke test on `v1.13.0-galactic.9`: (filled in after promote).
+
+## v1.13.0-galactic.8 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream (no
+version bump) to add the auto-follow intent and selection-freeze
+correctness patches below.
+
+### Patches added in this revision
+
+- **Gesture-sourced follow intent (`Terminal.scrolledUpByUser`)** — a new
+  flag distinct from `userScrolling`. `userScrolling` is written by both
+  scroll gestures and selection, so a transient selection could strand it
+  true while the viewport sat at the live bottom, silently disabling
+  auto-follow. `scrolledUpByUser` is written ONLY by `scrollTo` — the funnel
+  every wheel / knob / page scroll passes through — from the resulting
+  position; selection and output never touch it. This gives recovery a
+  single-writer intent signal to distinguish a genuine scroll-up from a
+  stranded freeze.
+- **`scrollTo` reconciles `scrolledUpByUser` ungated by selection**
+  (`AppleTerminalView`) — reconciled on every scroll movement regardless of
+  selection state, so scrolling back to the bottom during an active
+  selection still clears follow intent. The adjacent `userScrolling`
+  reconciliation is skipped during selection, which is what left the gate
+  stranded.
+- **`feedPrepare` recovery keys off `scrolledUpByUser`**
+  (`AppleTerminalView`) — clears a stranded `userScrolling` whenever the
+  user has not gesture-scrolled up, regardless of current scroll position.
+  The prior guard required `yDisp >= yBase`, so once drift opened up it
+  could never recover. Still gated on `!selection.active`, preserving the
+  selection-freeze invariant.
+- **`selectionChanged` freezes the viewport only on a non-empty selection**
+  (`MacTerminalView`) — gates on `selection.active && selection.hasSelectionRange`.
+  An empty soft-start selection (`start == end`, produced by a click with a
+  hair of mouse movement) no longer freezes the viewport and disables
+  auto-follow.
+- **`mouseUp` clears an empty selection** (`MacTerminalView`) — a drag that
+  ends with no range (`!hasSelectionRange`) clears `selection.active` on
+  release. `mouseUp` otherwise never cleared it, so a stray micro-drag left
+  `selection.active` stranded true and froze auto-follow until a later
+  click.
+
+### Verification
+
+- `GITHUB_ACTIONS=true swift build` on the fork passes.
+- Galactic smoke test on `v1.13.0-galactic.8`: Galactic `swift build` +
+  `swift test` green against this tag.
+
+## v1.13.0-galactic.7 — upstream v1.13.0
+
+Base: upstream at tag `v1.13.0`. Re-cut against the same upstream (no
+version bump) to add the caret patches below.
+
+Note: `.5` and `.6` were prior re-cuts against this same upstream and did
+not receive PATCHES entries — `.6` added the `scrollTo` reorder (sets
+`userScrolling` before invalidating the view, closing the
+following-but-drifted transient). `.7` carries everything `.6` had plus
+the caret patches below.
+
+### Patches added in this revision
+
+- **Caret reposition on focus gain** — `becomeFirstResponder` and the
+  `NSWindowDidBecomeMainNotification` handler now call
+  `updateCursorPosition()` after restyling. Focus-gain alone restyled the
+  caret (shape/blink) but never repositioned it, so a cursor that moved
+  while the window was unfocused painted at a stale cell until the next
+  output. Repositioning on focus eliminates that drift.
+- **`repositionCaret()` public method** — public wrapper over the internal
+  `updateCursorPosition()` on `AppleTerminalView`, so a Galactic subclass
+  can force a caret reposition after it mutates the viewport (e.g. snapping
+  to the live bottom on focus), where the internal display cycle would
+  otherwise leave the caret frame stale until the next output.
+
+### Verification
+
+- `swift build` on the fork passes.
+- Galactic smoke test on `v1.13.0-galactic.7`: (filled in Phase 2).
 
 ## v1.13.0-galactic.4 — upstream v1.13.0
 
