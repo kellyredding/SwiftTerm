@@ -249,13 +249,13 @@ public struct CharData: CustomDebugStringConvertible {
         return "CharData: \(code) \(ch)"
     }
     
-    static let maxRune = 1 << 22
+    public static let maxRune = 1 << 22
 
     static let defaultAttr = Attribute(fg: .defaultColor, bg: .defaultColor, style: .none)
     static let invertedAttr = Attribute(fg: .defaultInvertedColor, bg: .defaultInvertedColor, style: .none)
     
     // Contains a rune, or a pointer into a Grapheme Cluster
-    var code: Int32
+    public var code: Int32
     
     ///Contains the number of columns used by the `Character` stored in this `CharData` on the screen.
     public private(set) var width: Int8

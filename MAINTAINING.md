@@ -21,13 +21,19 @@ specific upstream version we want to adopt.
 
 ## Repository invariants
 
-- **`main` branch**: exactly three commits in fixed order, none of
-  which come from upstream's lineage.
-  1. **Orphan root**: MAINTAINING.md only. Truly stable across bumps —
-     same SHA on every release.
-  2. **Upstream import**: imports the targeted upstream SwiftTerm tag
+- **`main` branch**: exactly four commits in fixed order, none of
+  which come from upstream's lineage. Commits 1–2 are the **base**:
+  they are rebuilt only by a deliberate base change, never by a bump.
+  1. **Orphan root**: `MAINTAINING.md` and a header-only `PATCHES.md`.
+     Truly stable across bumps — same SHA on every release. It carries
+     no release metadata, so its tree never changes.
+  2. **API smoke sub-package**: `GalacticApiSmoke/`, a compile-only
+     contract against the public surface Galactic depends on. Base
+     infrastructure, not a patch — a bump must preserve it, which is
+     why Step 4a branches from here and not from commit 1.
+  3. **Upstream import**: imports the targeted upstream SwiftTerm tag
      as a single tree-replace commit. Replaced each bump.
-  3. **Galactic customization**: applies the Galactic patch on top, plus
+  4. **Galactic customization**: applies the Galactic patch on top, plus
      updates `PATCHES.md` with the release's entry. HEAD always points
      here; rewordable via `git commit --amend` during a bump.
 
@@ -117,38 +123,44 @@ BlockElement boundary fix; upstream `#500` superseded our
 
 ### Step 4 — Build the bumped state on a branch
 
-The bump rebuilds commits 2 and 3 on top of commit 1 (the orphan
-MAINTAINING.md root). Three sub-steps:
+The bump rebuilds commits 3 and 4 on top of the base (commits 1–2).
+Three sub-steps:
 
-#### 4a — Branch off commit 1
+#### 4a — Branch off the base
+
+The base is commit 2, not commit 1. Branching from the orphan root
+would leave `GalacticApiSmoke/` out of the new lineage and silently
+ship a release without it.
 
 ```bash
-# Commit 1 is the orphan root — same SHA on every release.
-COMMIT_1=$(git rev-list --max-parents=0 main)
-git checkout -b bump/v<target> $COMMIT_1
+# Base = commit 2, the last commit before the upstream import. Step 1
+# has just tagged main in its canonical four-commit state, so main~2
+# resolves to it. Do NOT use `git rev-list --max-parents=0`, which
+# always returns commit 1 and drops the smoke sub-package.
+BASE=$(git rev-parse main~2)
+git checkout -b bump/v<target> $BASE
 ```
 
-#### 4b — Build commit 2 (upstream import)
+#### 4b — Build commit 3 (upstream import)
 
 Replace the working tree with the new upstream tag's content while
-preserving MAINTAINING.md:
+preserving everything the base owns:
 
 ```bash
-# Snapshot MAINTAINING.md (read-tree --reset wipes it)
-cp MAINTAINING.md /tmp/maint.bak
-
-# Replace tree with upstream's
+# Replace tree with upstream's (this wipes the base's files)
 git read-tree --reset -u v<target>
 
-# Restore MAINTAINING.md
-cp /tmp/maint.bak MAINTAINING.md
-git add MAINTAINING.md
+# Restore every base-owned path. Deliberately not a list of filenames:
+# naming files is how PATCHES.md and GalacticApiSmoke/ came to be
+# dropped, and anything added to the base later would be lost the same
+# way.
+git checkout $BASE -- .
 
 # Commit
 git commit -m "Import SwiftTerm v<target> from upstream"
 ```
 
-#### 4c — Build commit 3 (Galactic customization patch)
+#### 4c — Build commit 4 (Galactic customization patch)
 
 Extract the previous bump's patch and apply it with 3-way merge:
 
@@ -198,13 +210,19 @@ git commit -m "Apply Galactic customization patch on top of v<target>"
 ### Step 5 — Verify the fork builds and tests
 
 ```bash
-swift build
-swift test
+GITHUB_ACTIONS=true swift build
+GITHUB_ACTIONS=true swift test
 ```
 
 Document any test failures. Some may pre-date the bump (upstream's own
 flaky tests). Capture which failures are NEW after our patches — those
 are regressions we caused.
+
+**Check `git status` afterwards.** `GITHUB_ACTIONS=true` drops the
+benchmark dependencies from the resolved graph, and SwiftPM rewrites
+the tracked `Package.resolved` to match — 65 lines of pins removed. It
+is a side effect of verifying, never something to commit. Restore it
+with `git checkout -- Package.resolved` before amending commit 4.
 
 ### Step 6 — Verify Galactic builds against the bump
 
@@ -323,10 +341,15 @@ issue mid-development), follow the same workflow:
 ## Patch history
 
 Per-release patch state lives in `PATCHES.md` at the repo root.
-That file is part of commit 3 (the customization commit) and gains
-a new entry on every bump. Each entry documents the upstream base,
-which patches were dropped (because upstream independently fixed
-the same bug), and what verification the release passed.
+The file is created empty-of-entries by commit 1 and gains a new
+entry on commit 4 (the customization commit) at every tagged
+release — both upstream bumps and re-cuts against the same
+upstream. Each entry documents the upstream base, which patches
+were dropped (because upstream independently fixed the same bug),
+and what verification the release passed.
 
-Commit 1 (this MAINTAINING.md) intentionally does NOT carry release
-metadata so its tree stays stable across bumps.
+Commit 1 intentionally carries no release metadata, so its tree
+stays stable across bumps. This document lives there and is edited
+on commit 4 like `PATCHES.md` is, which is why commit 1's own copy
+of it can be older than the one at `HEAD`. Read this file from
+`HEAD`, never from a checkout of the base.

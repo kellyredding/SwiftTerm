@@ -49,7 +49,8 @@ extension NSColor {
 
     static func make (red: CGFloat, green: CGFloat, blue: CGFloat, alpha: CGFloat) -> NSColor
     {
-        return NSColor (deviceRed: red, green: green, blue: blue, alpha: alpha)
+        // GALACTIC: Use sRGB for true color (24-bit) values, matching Terminal.app rendering.
+        return NSColor (srgbRed: red, green: green, blue: blue, alpha: alpha)
     }
     
     static func make (hue: CGFloat, saturation: CGFloat, brightness: CGFloat, alpha: CGFloat) -> TTColor
@@ -63,7 +64,11 @@ extension NSColor {
 
     static func make (color: Color) -> NSColor
     {
-        return NSColor (deviceRed: CGFloat (color.red) / 65535.0,
+        // GALACTIC: Use sRGB color space instead of uncalibrated device RGB.
+        // On P3 displays, deviceRed produces more saturated colors than intended,
+        // shifting magenta toward purple and cyan toward teal. sRGB matches
+        // Terminal.app's color rendering.
+        return NSColor (srgbRed: CGFloat (color.red) / 65535.0,
                         green: CGFloat (color.green) / 65535.0,
                         blue: CGFloat (color.blue) / 65535.0,
                         alpha: 1.0)
