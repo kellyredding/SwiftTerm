@@ -136,13 +136,12 @@ bugs in the v1.10.1..v1.13.0 range:
 - `GITHUB_ACTIONS=true swift build` on the fork passes. The
   `GITHUB_ACTIONS=true` env var is upstream's mechanism for
   excluding the `package-benchmark` dependency, which requires
-  jemalloc to be installed system-wide. SwiftTerm library
-  consumers (Galactic, Galactic, etc.) are unaffected — they pull
-  in only the `SwiftTerm` product, which has no benchmark
+  jemalloc to be installed system-wide. Galactic is unaffected —
+  it pulls in only the `SwiftTerm` product, which has no benchmark
   dependency at all.
 - `swift test` results: <to be filled in after first run>
-- Galactic smoke test on `v1.13.0-galactic.1`: <pending — see
-  Galactic Phase 3 / setup-vendor regeneration>
+- Galactic smoke test on `v1.13.0-galactic.1`: passed (Galactic
+  `swift build` + `swift test` green against this tag).
 
 ## v1.10.1-galactic.1 — upstream v1.10.1 (initial fork release)
 
@@ -150,8 +149,7 @@ Base: upstream `migueldeicaza/SwiftTerm` at tag `v1.10.1`.
 
 ### Patches included
 
-Full patch from Galactic's
-`GalacticApp/scripts/galactic-swiftterm-rendering.patch` applied verbatim.
+Full patch from Galactic's prior in-tree consumer applied verbatim.
 Patches included (categories, not exhaustive):
 
 - Memory leak fix in `CircularList.trimStart` and

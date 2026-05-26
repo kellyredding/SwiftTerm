@@ -4,16 +4,16 @@
 
 This repository is a personal fork of
 [migueldeicaza/SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)
-with Galactic/Galactic-specific customization patches applied on top. It
-exists to:
+with Galactic-specific customization patches applied on top. It exists to:
 
-- Let Galactic.app consume SwiftTerm via Swift Package Manager instead of
-  vendoring an in-tree copy
-- Provide a consumable terminal-emulator dependency for the Galactic
-  module (`kellyredding/Galactic`) and any other Swift apps in the
-  `kellyredding/*` ecosystem
+- Provide a SwiftPM-installable terminal-emulator dependency for
+  [`kellyredding/Galactic`](https://github.com/kellyredding/Galactic)
 - Keep Galactic's customization patches in one place where they can be
   managed across upstream version bumps
+
+Galactic is the direct consumer of this fork; what Galactic does with
+it (which apps it serves, how it surfaces the engine) is Galactic's
+concern, not this fork's.
 
 The fork tracks upstream tagged releases. It is NOT continuously rebased
 against upstream `main` — bumps are deliberate operations triggered by a
@@ -206,31 +206,32 @@ Document any test failures. Some may pre-date the bump (upstream's own
 flaky tests). Capture which failures are NEW after our patches — those
 are regressions we caused.
 
-### Step 6 — Smoke test in Galactic
+### Step 6 — Verify Galactic builds against the bump
 
-The fork can build and pass `swift test` while still breaking Galactic.
-Galactic's smoke-test checklist exercises the patched behavior:
+The fork can build and pass `swift test` while still breaking behavior
+that Galactic relies on. Point Galactic's SwiftTerm pin at the bump
+branch and verify:
 
-1. `cd ~/projects/kellyredding/galactic/GalacticApp && xcodegen generate && make build` — must succeed.
-2. Open a session — terminal renders normally.
-3. Scroll up into scrollback and back down — auto-follow invariants
-   hold.
-4. Select text and Cmd+C — selection works.
-5. Resize the window — terminal reflows correctly.
-6. Change theme or default font size — bridge applies through the
-   protocol.
-7. Toggle the sidebar while a Claude session is streaming output —
-   slide remains smooth.
+```bash
+cd ~/projects/kellyredding/Galactic
+# Edit Package.swift to point SwiftTerm at the bump branch
+# (e.g., `.branch("bump/v<target>")` or a specific commit SHA)
+swift build
+swift test
+```
 
-To wire Galactic at the bump branch temporarily for this smoke test,
-either:
-- Pre-Phase-3: regenerate the in-tree patch file from the bump branch
-  state and run `setup-vendor.sh`.
-- Post-Phase-3: point Galactic's SPM dependency at the bump branch SHA
-  via `project.yml`, regenerate, build.
+Galactic's package tests are a minimal public-surface smoke check —
+they catch missing-public-surface and obvious-API regressions but
+cannot exercise rendering behavior, auto-follow invariants, focus
+handling, or scroll inertia. Those behaviors require a chrome-hosting
+consumer of Galactic, and that verification belongs in Galactic's
+[MAINTAINING.md](https://github.com/kellyredding/Galactic/blob/main/MAINTAINING.md) —
+performed by Galactic's maintainer before Galactic itself cuts a new
+release tag.
 
-If anything regresses, fix in the bump branch. Don't promote to `main`
-until smoke test passes.
+If Galactic's `swift build` or `swift test` regresses against the
+bump branch, fix here on the bump branch. Don't promote to `main`
+until Galactic compiles and its package tests pass.
 
 ### Step 7 — Promote the bump to `main`
 
@@ -251,11 +252,13 @@ state. The previous `main` HEAD remains reachable via its galactic tag.
 
 Separate Galactic commit, not part of this fork's bump.
 
-- Pre-Phase-3: regenerate `GalacticApp/scripts/galactic-swiftterm-rendering.patch`
-  from the new state, run setup-vendor, commit to Galactic.
-- Post-Phase-3: bump the version pin in Galactic's `project.yml` from
-  `v<previous>-galactic.<rev>` to `v<target>-galactic.1`, regenerate the
-  Xcode project, commit to Galactic.
+Bump the SwiftTerm pin in Galactic's `Package.swift` from
+`v<previous>-galactic.<rev>` to the freshly-tagged `v<target>-galactic.1`,
+run `swift build && swift test`, commit on Galactic's `main`, then cut a
+new Galactic release tag. From there Galactic's downstream consumers
+adopt the new Galactic release on their own cadence — that handoff is
+documented in Galactic's
+[MAINTAINING.md](https://github.com/kellyredding/Galactic/blob/main/MAINTAINING.md).
 
 ## Safety rules
 
